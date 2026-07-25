@@ -115,11 +115,16 @@ are included.
   **RTSP port (554) forwarded** on the router to an external port that you set as
   the camera's **RTSP port**. (iVMS works over one port because it uses
   Hikvision's proprietary SDK protocol, which browsers can't play — hence RTSP.)
-- **Live motion indicator** — each camera lights up a red **MOTION** badge/glow
-  and pops the captured frame full-screen the moment the DVR detects motion. The
-  server subscribes to the DVR's event alert stream (no polling of the video), so
-  it works even with the browser closed. Cameras whose firmware doesn't expose the
-  stream simply never light up.
+- **Live motion indicator** — the moment the DVR detects motion, that camera's tile
+  gets a **blinking solid red border** and the captured frame pops up full-screen.
+  The server subscribes to the DVR's event alert stream (no polling of the video),
+  so it works even with the browser closed. (Requires the camera's motion trigger to
+  have "Notify Surveillance Center" enabled — use **Diagnose** below to check/fix it.)
+- **Diagnose** — a per-device button (device header) audits each visible camera's
+  motion→email→app pipeline: motion enabled + area painted, the VMD trigger's
+  `email` and `center` linkages, and SMTP. It flags problems and offers one-click
+  **Fix** for the repairable ones (adds the missing `email`/`center` linkage). Hidden
+  cameras are skipped.
 - **Save images to a folder** — the **Save** button (and every motion event) writes
   a **max-resolution (720p)** JPEG to a folder you choose in **⚙ Settings**
   (default `~/CameraViewer`, created if missing). Saving happens on the server, so

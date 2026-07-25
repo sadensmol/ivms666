@@ -213,11 +213,21 @@ function syncAuto() {
 
 /* ---- motion indicator (per-camera, from the device alert stream) ---- */
 const motionState = {};   // deviceId -> { inputIndex: bool }
-let motionTimer = null;
+let motionTimer = null, motionTileTimer = null;
 function startMotionPolling() {
   if (motionTimer) clearInterval(motionTimer);
   motionTimer = setInterval(pollMotion, 1500);
   pollMotion();
+  // tiles with active motion refresh every 1s; all other tiles stay on the
+  // configured "Refresh (s)" interval (syncAuto).
+  if (motionTileTimer) clearInterval(motionTileTimer);
+  motionTileTimer = setInterval(refreshMotionTiles, 1000);
+}
+function refreshMotionTiles() {
+  for (const d of devices) {
+    const st = motionState[d.id] || {};
+    for (const ch of visibleChannels(d)) if (st[String(ch.input)]) captureTile(d, ch);
+  }
 }
 async function pollMotion() {
   for (const d of devices) {
@@ -237,25 +247,33 @@ function applyMotion(d, channels) {
     // fresh inactive->active: refresh the visible frame + pop the captured shot
     if (active && !prev[String(ch.input)]) { captureTile(d, ch); showMotionPopup(d, ch); }
   }
+  // auto-close the popup once ITS channel's motion has ended (no more active state)
+  if (motCur && motCur.deviceId === d.id && !channels[motCur.input]) closeMotionPopup();
 }
 
-/* ---- motion popup: show the captured frame full-screen ---- */
-let motTimer = null;
-function anyOverlayOpen() {
-  return ['devOverlay','setOverlay','diagOverlay','liveOverlay','overlay'].some(id => $(id).classList.contains('open'));
-}
+/* ---- motion popup: full-screen, live-refreshing while motion lasts ---- */
+let motTimer = null;   // 1s image-refresh interval
+let motCur = null;     // {deviceId, chId, input, name, dname, host} currently shown
 function showMotionPopup(d, ch) {
-  if (anyOverlayOpen()) return;   // don't cover a modal the user already opened
-  $('motTitle').textContent = 'Motion — '+(d.name||d.host)+' / '+ch.name+'  ·  '+new Date().toLocaleTimeString();
-  // request the max-resolution still (what was saved to disk), not the view quality
-  $('motImg').src = '/snapshot?device='+encodeURIComponent(d.id)+'&ch='+encodeURIComponent(ch.id)+
-                    '&res=1280x720&ts='+Date.now();
+  // Only the Live view genuinely conflicts (it's already showing real-time video);
+  // over everything else the motion alert should still pop.
+  if ($('liveOverlay').classList.contains('open')) return;
+  motCur = { deviceId:d.id, chId:ch.id, input:String(ch.input), name:ch.name, dname:d.name, host:d.host };
+  refreshMotionImg();
   $('motOverlay').classList.add('open');
-  if (motTimer) clearTimeout(motTimer);
-  motTimer = setTimeout(closeMotionPopup, 12000);   // auto-dismiss
+  if (motTimer) clearInterval(motTimer);
+  motTimer = setInterval(refreshMotionImg, 1000);   // live-update the big image every 1s
+}
+function refreshMotionImg() {
+  if (!motCur) return;
+  $('motTitle').textContent = 'Motion — '+(motCur.dname||motCur.host)+' / '+motCur.name+'  ·  '+new Date().toLocaleTimeString();
+  // request the max-resolution still (not the view quality), cache-busted each tick
+  $('motImg').src = '/snapshot?device='+encodeURIComponent(motCur.deviceId)+'&ch='+encodeURIComponent(motCur.chId)+
+                    '&res=1280x720&ts='+Date.now();
 }
 function closeMotionPopup() {
-  if (motTimer) { clearTimeout(motTimer); motTimer=null; }
+  if (motTimer) { clearInterval(motTimer); motTimer=null; }
+  motCur = null;
   $('motOverlay').classList.remove('open'); $('motImg').removeAttribute('src');
 }
 

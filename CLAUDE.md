@@ -128,9 +128,20 @@ python3 -m cameraviewer import --file found.json                 # load scan out
   `inactive`. `channelID` in the event is the **video-input index** (1..4) = the
   tile's `input`; the picture id for auto-save is `<input>01`.
 - On a fresh inactive→active transition the monitor **auto-saves** a max-res JPEG
-  (debounced ≤1/channel/10s) and the browser shows a red MOTION badge/glow +
-  a full-screen popup of the captured frame. Monitors **start at server startup**
-  (`events.start_all()`), so capture works even with no browser open.
+  (debounced ≤1/channel/10s) and the browser shows a **blinking solid red border**
+  around the tile (`.tile.motion .corners`, no text badge) + a full-screen popup
+  (`#motOverlay`) that **live-refreshes the 720p still every 1s** and **stays open
+  until that channel's motion ends** (closed by `applyMotion` on the falling edge,
+  not a timer). Suppressed only while the Live view is open. A tile with **active
+  motion also refreshes its snapshot every 1s** (`refreshMotionTiles`); all other
+  tiles stay on the configured "Refresh (s)" interval. Monitors **start at server
+  startup** (`events.start_all()`), so capture works even with no browser open.
+- **Diagnose** (`diagnose.py`, per-device header button, `GET /diagnose` +
+  `POST /diagnose/fix`): audits each **non-hidden** channel for motion
+  enabled/area + VMD `email`/`center` linkage + device SMTP, and one-click
+  **auto-fixes** the missing `email`/`center` linkages (RMW, preserving others).
+  Skips channels in the device's `hidden` list (`config.get_hidden`). Non-fixable
+  gaps (motion off, no area, SMTP unset) are reported with guidance.
 - A `404/501/403` on the alert stream marks the device "unsupported" and the
   monitor **stops** (don't hammer — a repeated 403 risks the write-lockout).
 - **Saving** is server-side (`store.save_snapshot`) to the configured folder
@@ -166,7 +177,8 @@ tests/                      # unittest; helpers.py has the fake camera transport
 
 Layering rule: `config` and `camera` are leaves. `motion` depends on `camera`.
 `store` depends on `camera`+`config`. `events` depends on `camera`+`config`+`store`.
-`server` depends on `config`/`camera`/`motion`/`events`/`store`/`live`/`web`.
+`diagnose` depends on `camera`+`motion`.
+`server` depends on `config`/`camera`/`motion`/`events`/`store`/`diagnose`/`live`/`web`.
 `cli` depends on `server`/`camera`. Don't create cycles.
 
 **Cross-module calls go through the module, not the name** — e.g. `motion.py`
