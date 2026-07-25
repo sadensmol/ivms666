@@ -8,9 +8,13 @@ import unittest
 import urllib.error
 import urllib.request
 
-from cameraviewer import config, live, server
+from cameraviewer import camera, config, events, live, server
 from tests.helpers import (
     FakeCamera, FakeProc, FAKE_JPEG, OK_RESP, all_on_gridmap, motion_xml, video_inputs_xml)
+
+
+def _raise_404(path):
+    raise urllib.error.HTTPError(path, 404, "Not Found", None, None)
 
 
 def camera_handler(method, path, body):
@@ -22,6 +26,22 @@ def camera_handler(method, path, body):
         if method == "GET":
             return ("application/xml", motion_xml(all_on_gridmap(), sensitivity=50))
         return ("application/xml", OK_RESP)
+    if path == "/ISAPI/System/reboot":
+        return ("application/xml", OK_RESP)
+    if path.startswith("/ISAPI/Event/triggers/VMD-"):
+        if method == "PUT":
+            return ("application/xml", OK_RESP)
+        return ("application/xml",
+                b'<EventTrigger xmlns="http://www.std-cgi.com/ver20/XMLSchema">'
+                b"<EventTriggerNotificationList>"
+                b"<EventTriggerNotification><notificationMethod>record</notificationMethod></EventTriggerNotification>"
+                b"<EventTriggerNotification><notificationMethod>email</notificationMethod></EventTriggerNotification>"
+                b"</EventTriggerNotificationList></EventTrigger>")  # missing center -> fixable
+    if path.startswith("/ISAPI/System/Network/mailing"):
+        return ("application/xml",
+                b"<mailing><hostName>smtp.x.com</hostName><receiverList>"
+                b"<receiver><receiverAddress>a@x.com</receiverAddress></receiver>"
+                b"</receiverList></mailing>")
     raise AssertionError("unexpected camera path: " + path)
 
 
@@ -30,10 +50,15 @@ class ServerTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self._orig_path = config.CONFIG_PATH
         config.CONFIG_PATH = os.path.join(self.tmp, "cfg.json")
-        config._state = {"devices": []}
+        self.save_dir = os.path.join(self.tmp, "shots")
+        config._state = {"devices": [], "settings": {"save_path": self.save_dir}}
 
         self.fake = FakeCamera(camera_handler)
         self.fake.__enter__()
+        # keep motion monitors off the real network: any that start exit at once
+        self._orig_open_stream = camera.open_stream
+        camera.open_stream = lambda cfg, path, timeout=60: _raise_404(path)
+        events.stop_all()
 
         self.httpd = server.Server(("127.0.0.1", 0), server.Handler)
         self.port = self.httpd.server_address[1]
@@ -42,6 +67,8 @@ class ServerTest(unittest.TestCase):
     def tearDown(self):
         self.httpd.shutdown()
         self.httpd.server_close()
+        events.stop_all()
+        camera.open_stream = self._orig_open_stream
         self.fake.__exit__()
         config.CONFIG_PATH = self._orig_path
         config._state = {"devices": []}
@@ -116,6 +143,69 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(json.loads(b)["ok"])
         # a PUT actually reached the (fake) camera
         self.assertTrue(any(p.endswith("/motionDetection") for p, _ in self.fake.puts))
+
+    def test_settings_get_and_update(self):
+        st, b = self.req("GET", "/settings")
+        self.assertEqual(st, 200)
+        self.assertIn("save_path", json.loads(b))
+        newp = os.path.join(self.tmp, "newshots")
+        st, b = self.req("PUT", "/settings", {"save_path": newp})
+        self.assertEqual(st, 200)
+        self.assertEqual(json.loads(b)["save_path"], os.path.abspath(newp))
+
+    def test_save_writes_max_res_jpeg(self):
+        _, dev = self.add_device()
+        st, b = self.req("POST", "/save", {"device": dev["id"], "ch": "101"})
+        self.assertEqual(st, 200)
+        data = json.loads(b)
+        self.assertTrue(data["ok"])
+        self.assertTrue(os.path.exists(data["path"]))          # written under save_dir
+        self.assertTrue(data["path"].startswith(self.save_dir))
+        self.assertTrue(any("videoResolutionWidth=1280" in p for p in self.fake.gets))
+        # unknown device -> ok False, no crash
+        _, b2 = self.req("POST", "/save", {"device": "nope", "ch": "101"})
+        self.assertFalse(json.loads(b2)["ok"])
+
+    def test_diagnose_route(self):
+        _, dev = self.add_device()
+        st, b = self.req("GET", f"/diagnose?device={dev['id']}")
+        self.assertEqual(st, 200)
+        rep = json.loads(b)
+        self.assertIn("channels", rep)
+        self.assertTrue(rep["smtp"]["ok"])
+        self.assertTrue(rep["fixable"])  # fake triggers miss 'center'
+        st2, _ = self.req("GET", "/diagnose?device=nope")
+        self.assertEqual(st2, 404)
+
+    def test_diagnose_fix_route(self):
+        _, dev = self.add_device()
+        st, b = self.req("POST", "/diagnose/fix", {"device": dev["id"]})
+        self.assertEqual(st, 200)
+        r = json.loads(b)
+        self.assertTrue(r["ok"])
+        # a linkage-adding PUT reached a VMD trigger
+        self.assertTrue(any(p.startswith("/ISAPI/Event/triggers/VMD-") for p, _ in self.fake.puts))
+        _, b2 = self.req("POST", "/diagnose/fix", {"device": "nope"})
+        self.assertFalse(json.loads(b2)["ok"])
+
+    def test_reboot_device(self):
+        _, dev = self.add_device()
+        st, b = self.req("POST", "/reboot", {"device": dev["id"]})
+        self.assertEqual(st, 200)
+        self.assertTrue(json.loads(b)["ok"])
+        self.assertTrue(any(p == "/ISAPI/System/reboot" for p, _ in self.fake.puts))
+        _, b2 = self.req("POST", "/reboot", {"device": "nope"})
+        self.assertFalse(json.loads(b2)["ok"])
+
+    def test_motion_state_route(self):
+        _, dev = self.add_device()
+        st, b = self.req("GET", f"/motion/state?device={dev['id']}")
+        self.assertEqual(st, 200)
+        data = json.loads(b)
+        self.assertIn("channels", data)
+        self.assertIsInstance(data["channels"], dict)
+        st2, _ = self.req("GET", "/motion/state?device=nope")
+        self.assertEqual(st2, 404)
 
     def test_hidden_setup_persists(self):
         _, dev = self.add_device()

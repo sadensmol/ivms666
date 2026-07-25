@@ -70,6 +70,98 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(config.list_devices(), [])
         self.assertFalse(config.delete_device(d["id"]))  # already gone
 
+    def test_write_read_devices_file_roundtrip(self):
+        path = os.path.join(self.tmp, "scan.json")
+        entries = [{"name": "cam", "host": "1.2.3.4", "port": "80",
+                    "user": "admin", "password": "p", "rtsp_port": "554"}]
+        config.write_devices_file(path, entries)
+        with open(path) as f:
+            self.assertEqual(json.load(f), {"devices": entries})
+        self.assertEqual(config.read_devices_file(path), entries)
+
+    def test_read_devices_file_accepts_bare_list(self):
+        path = os.path.join(self.tmp, "bare.json")
+        with open(path, "w") as f:
+            json.dump([{"host": "5.6.7.8"}], f)
+        self.assertEqual(config.read_devices_file(path), [{"host": "5.6.7.8"}])
+
+    def test_import_devices_adds_and_persists(self):
+        added, skipped = config.import_devices(
+            [{"host": "1.2.3.4", "user": "admin", "password": "p", "rtsp_port": "554"}])
+        self.assertEqual((added, skipped), (1, 0))
+        listed = config.list_devices()
+        self.assertEqual(listed[0]["host"], "1.2.3.4")
+        self.assertEqual(listed[0]["rtspPort"], "554")
+        self.assertEqual(config.get_cfg(listed[0]["id"])["password"], "p")
+        # written to disk with the default HTTP port filled in
+        with open(config.CONFIG_PATH) as f:
+            self.assertEqual(json.load(f)["devices"][0]["port"], "80")
+
+    def test_import_devices_dedupes_by_host_port_user(self):
+        entry = {"host": "1.2.3.4", "user": "admin", "password": "p", "rtsp_port": "554"}
+        config.import_devices([entry])
+        added, skipped = config.import_devices([entry])  # same host+port+user
+        self.assertEqual((added, skipped), (0, 1))
+        self.assertEqual(len(config.list_devices()), 1)
+
+    def test_import_devices_skips_hostless(self):
+        added, skipped = config.import_devices([{"user": "admin"}])
+        self.assertEqual((added, skipped), (0, 1))
+
+    def test_default_scan_string_forms_become_lists(self):
+        orig = config._load_defaults
+        config._load_defaults = lambda: {"scan": {
+            "range": "10.0.0.0/24", "ports": "554,8554",
+            "logins": ["admin", " root "], "passwords": "12345, admin ,"}}
+        try:
+            s = config.default_scan()
+        finally:
+            config._load_defaults = orig
+        self.assertEqual(s["range"], ["10.0.0.0/24"])              # single string -> 1-item list
+        self.assertEqual(s["ports"], ["554", "8554"])             # comma string -> list
+        self.assertEqual(s["logins"], ["admin", "root"])          # trimmed
+        self.assertEqual(s["passwords"], ["12345", "admin"])       # csv string + blanks dropped
+
+    def test_default_scan_json_lists(self):
+        orig = config._load_defaults
+        config._load_defaults = lambda: {"scan": {
+            "range": ["192.168.1.0/24", "192.168.2.0/24"], "ports": ["554", "8554"]}}
+        try:
+            s = config.default_scan()
+        finally:
+            config._load_defaults = orig
+        self.assertEqual(s["range"], ["192.168.1.0/24", "192.168.2.0/24"])
+        self.assertEqual(s["ports"], ["554", "8554"])
+
+    def test_default_scan_defaults_when_absent(self):
+        orig = config._load_defaults
+        config._load_defaults = lambda: {"scan": {}}
+        try:
+            s = config.default_scan()
+        finally:
+            config._load_defaults = orig
+        self.assertEqual(s, {"range": [], "ports": ["554"], "logins": [], "passwords": []})
+
+    def test_settings_default_and_update_persist(self):
+        # default when unset
+        self.assertEqual(config.get_settings()["save_path"], config.DEFAULT_SAVE_PATH)
+        # update expands ~ to an absolute path and persists
+        out = config.update_settings({"save_path": "~/shots"})
+        self.assertTrue(os.path.isabs(out["save_path"]))
+        self.assertTrue(out["save_path"].endswith("/shots"))
+        with open(config.CONFIG_PATH) as f:
+            self.assertEqual(json.load(f)["settings"]["save_path"], out["save_path"])
+        # blank/absent save_path leaves the current value untouched
+        config.update_settings({"save_path": ""})
+        self.assertEqual(config.get_settings()["save_path"], out["save_path"])
+
+    def test_device_label_prefers_name_then_host(self):
+        d = self._add(name="Front", host="9.9.9.9")
+        self.assertEqual(config.device_label(d["id"]), "Front")
+        d2 = self._add(name="", host="8.8.8.8")
+        self.assertEqual(config.device_label(d2["id"]), "8.8.8.8")
+        self.assertEqual(config.device_label("missing"), "camera")
+
     def test_persistence_and_reload(self):
         d = self._add(host="9.9.9.9")
         # file written, restricted to the user

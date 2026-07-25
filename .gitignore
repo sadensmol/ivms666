@@ -27,3 +27,4 @@ camera_viewer.json
 .vscode/
 *.swp
 *~
+rtsp-scan-output.json

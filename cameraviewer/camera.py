@@ -7,6 +7,11 @@ import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 
+# The device's picture endpoint caps at 720p — it rejects 1080p — so this is the
+# "max resolution" still we can save (see CLAUDE.md). fetch_snapshot falls back
+# to the device default if even this is refused.
+MAX_STILL_RES = "1280x720"
+
 
 def _opener(cfg, url):
     pwmgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
@@ -40,6 +45,18 @@ def camera_put(cfg, path, body, timeout=15):
         return resp.headers.get("Content-Type", ""), resp.read()
 
 
+def open_stream(cfg, path, timeout=60):
+    """Open a long-lived GET (e.g. the ISAPI event alert stream) and return the
+    raw response object for incremental `.read()`. Digest/Basic auth handled as
+    usual; the caller must `.close()` it. `timeout` is the per-read socket
+    timeout — a silent stream past it raises and the caller reconnects."""
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"http://{cfg['host']}:{cfg['port']}{path}"
+    req = urllib.request.Request(url, headers={"User-Agent": "camera-viewer"})
+    return _opener(cfg, url).open(req, timeout=timeout)
+
+
 def fetch_snapshot(cfg, channel_id, resolution=None):
     """Fetch a JPEG still. `resolution` like '1280x720' asks the DVR for a
     higher-quality frame (the endpoint defaults to a low D1 image); if the
@@ -52,6 +69,15 @@ def fetch_snapshot(cfg, channel_id, resolution=None):
         except Exception:
             pass  # unsupported size / parse error -> device default below
     return camera_get(cfg, base)
+
+
+def reboot(cfg):
+    """Reboot the whole device (Hikvision ISAPI `PUT /ISAPI/System/reboot`, empty
+    body). This drops every channel/stream for ~a minute. Returns (ok, message)."""
+    _, resp = camera_put(cfg, "/ISAPI/System/reboot", b"")
+    body = resp.decode("utf-8", "replace")
+    ok = ("<statusString>OK" in body) or ("statusCode>1<" in body) or body.strip() == ""
+    return ok, body[:400]
 
 
 def _localname(tag):

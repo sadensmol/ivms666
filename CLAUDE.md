@@ -2,6 +2,15 @@
 
 Guidance for working in this repo. Read before editing.
 
+> **HARD RULE — the *assistant* must never touch `cameraviewer/default_config.json`.**
+> NEVER open, read, edit, or overwrite it with your tools. It is a
+> **user-owned runtime input file** the user maintains by hand. The running
+> *program* reads it at runtime (`config.default_scan` → `scan.range`,
+> `scan.ports`, `scan.logins`, `scan.passwords` — each a JSON **list** of
+> strings, e.g. `"range": ["192.168.1.0/24", "192.168.2.0/24"]`; a single or
+> comma-separated string is still accepted); that is fine. Only the assistant is
+> barred from reading/writing the file.
+
 > **Keep this file current.** Whenever you discover something new about the
 > device or codebase, hit a gotcha, or make an architectural decision, update
 > the relevant section of this file **in the same change**. Especially record
@@ -21,7 +30,42 @@ Run it:
 ```
 python3 camera_viewer.py            # launches server + opens browser
 python3 -m cameraviewer discover --user admin --password '...'   # CLI channel list
+python3 -m cameraviewer rtsp-scan --range 192.168.1.0/24         # find RTSP ports + print links
+python3 -m cameraviewer rtsp-scan                                # no args -> scan.range/ports from cameraviewer/default_config.json
+python3 -m cameraviewer rtsp-scan --host <ip> --logins admin,root --passwords 12345,admin --output found.json
+python3 -m cameraviewer import --file found.json                 # load scan output into the app (~/.camera_viewer.json)
 ```
+
+> **rtsp-scan credential verification + output → import (the setup flow):**
+> Credentials default to `scan.logins`/`scan.passwords` from `default_config.json`;
+> passing `--logins`/`--passwords` (comma-separated) **overrides** that list
+> entirely — when provided, only the provided values are used (each list
+> overrides independently). For each RTSP port found, the scan tries **every
+> login with every password**, in order (login 1 × all passwords, then login 2,
+> …), **sequentially** (concurrent auth can trip a DVR failed-login lockout) and
+> **stopping at the first accepted credential per port** (a port needs only one
+> working login; `probe_credentials(stop_on_first=True)`), answering the device's
+> Digest/Basic 401 with an authenticated `DESCRIBE`; a final `200` means the
+> credential works. **Hosts are scanned in parallel** — `scan_and_verify` runs a
+> pool of `min(--parallel, #hosts)` threads (default `--parallel=10`), one host
+> per thread, doing detect+verify end-to-end; **credentials stay sequential
+> *within* a host** (never concurrent auth to one DVR). Progress is therefore
+> per-host on one line (`scanning N of M hosts`), not per-credential. Verified
+> hits are written to `--output`
+> (default `rtsp-scan-output.json`) as an import-ready `{"devices":[…]}` file,
+> which `import --file <path>` merges into the internal config
+> (`~/.camera_viewer.json`, deduped by host+rtsp_port+user). The device's
+> **HTTP/ISAPI `port`** (snapshots/motion) can't be discovered by an RTSP scan,
+> so the output defaults it to `80` — adjust after import if the web port differs.
+
+> **rtsp-scan safety:** only scan IPs/ranges you own. `--range` accepts CIDR,
+> dash (`10.0.0.5-9` last-octet shorthand, or full `10.0.0.5-10.0.1.20` which
+> rolls over octet boundaries), or a single IP. A wide public range (e.g. a `/16`
+> of someone's ISP block) is mass-scanning third-party hosts — don't.
+> **CIDR starts at the exact address written** and goes UP to the top of the block
+> (never below): `192.0.0.62/24` -> `.62 … .255`; a host part of 0
+> (`192.0.0.0/24`) covers the whole block. Network/broadcast addresses are
+> included (`expand_range` uses `ip_interface`, not `.hosts()`).
 
 ## The target device (known facts)
 
@@ -71,18 +115,49 @@ python3 -m cameraviewer discover --user admin --password '...'   # CLI channel l
   while (see gotchas). `motion.set_motion` clamps to `[SENS_MIN, SENS_MAX]` =
   `[0, 6]`; the UI slider is 0–6. **Never send an unclamped value.**
 
+## Motion detection: AREA editor vs LIVE indicator (two separate things)
+
+- **Area editor** (`motion.py`, the per-tile ⚙ → "Motion detection area"): edits
+  *where* the DVR looks (the gridMap) and sensitivity. Read-modify-write, guarded.
+- **Live indicator** (`events.py`, `/motion/state`): shows *when* the DVR fires
+  motion, per camera. The server holds one long-lived GET per device on
+  `/ISAPI/Event/notification/alertStream` (a `multipart/mixed` push of
+  `<EventNotificationAlert>` XML). We act on `eventType=VMD`: a channel is
+  "active" if a VMD `active` event arrived within `HOLD_SECONDS` (≈6s) — the hold
+  window covers firmwares that repeat `active` and then stop without sending
+  `inactive`. `channelID` in the event is the **video-input index** (1..4) = the
+  tile's `input`; the picture id for auto-save is `<input>01`.
+- On a fresh inactive→active transition the monitor **auto-saves** a max-res JPEG
+  (debounced ≤1/channel/10s) and the browser shows a red MOTION badge/glow +
+  a full-screen popup of the captured frame. Monitors **start at server startup**
+  (`events.start_all()`), so capture works even with no browser open.
+- A `404/501/403` on the alert stream marks the device "unsupported" and the
+  monitor **stops** (don't hammer — a repeated 403 risks the write-lockout).
+- **Saving** is server-side (`store.save_snapshot`) to the configured folder
+  (header ⚙ Settings → `save_path`, default `~/CameraViewer`), always at
+  `camera.MAX_STILL_RES` (720p — this DVR's max still). Manual **Save** and motion
+  auto-capture use the same path. The browser can't write arbitrary paths, so the
+  path is a server setting, not a browser download.
+- **Frontend note:** per-tile actions are `Live | Save | ⚙`; the ⚙ menu holds
+  "Motion detection area" and "Hide this camera" (the old ✕).
+
 ## Architecture / structure to follow
 
 ```
 camera_viewer.py            # thin launcher -> cameraviewer.cli.main()
 cameraviewer/
-  config.py                 # device store + JSON persistence (~/.camera_viewer.json, 0600)
-  camera.py                 # ISAPI HTTP (get/put), snapshot, channel discovery, safe XML parse
-  motion.py                 # gridMap codec + get_motion / set_motion (read-modify-write)
+  config.py                 # device store + JSON persistence (~/.camera_viewer.json, 0600); app settings (save_path); device-file import/export
+  camera.py                 # ISAPI HTTP (get/put/open_stream), snapshot, MAX_STILL_RES, channel discovery, safe XML parse
+  motion.py                 # gridMap codec + get_motion / set_motion (read-modify-write)  [detection AREA editor]
+  events.py                 # motion ALERT stream: per-device daemon watches /ISAPI/Event/notification/alertStream, tracks per-channel VMD state (hold window), auto-saves on motion. get_state / start_all / ensure / stop
+  store.py                  # server-side snapshot saving to config save_path at MAX_STILL_RES (manual Save + motion auto-capture)
+  diagnose.py               # per-device health check of the motion->email->UI pipeline (motion enabled/area, VMD email+center linkage, SMTP) + safe auto-fix (RMW adds missing email/center to VMD triggers)
   live.py                   # RTSP->MJPEG via ffmpeg (real-time Live view); rtsp_url + check + open_mjpeg
+  scan.py                   # rtsp-scan: probe ports via RTSP OPTIONS; verify creds via authed DESCRIBE; scan_and_verify (host-parallel pipeline) + expand_range/expand_ranges + rtsp_link + device_entry
+  default_config.json       # USER-OWNED runtime input (devices=[], scan range/ports). Assistant: never read/edit. config.py reads it at runtime only.
   web.py                    # loads static/index.html + static/app.js
   server.py                 # BaseHTTPRequestHandler routes + ThreadingHTTPServer + run_gui()
-  cli.py                    # argparse: GUI (default) or `discover`
+  cli.py                    # argparse: GUI (default), `discover`, `rtsp-scan`, `import`
   __main__.py               # `python3 -m cameraviewer`
   static/index.html         # markup + CSS (frontend)
   static/app.js             # all frontend JS
@@ -90,8 +165,9 @@ tests/                      # unittest; helpers.py has the fake camera transport
 ```
 
 Layering rule: `config` and `camera` are leaves. `motion` depends on `camera`.
-`server` depends on `config`/`camera`/`motion`/`web`. `cli` depends on
-`server`/`camera`. Don't create cycles.
+`store` depends on `camera`+`config`. `events` depends on `camera`+`config`+`store`.
+`server` depends on `config`/`camera`/`motion`/`events`/`store`/`live`/`web`.
+`cli` depends on `server`/`camera`. Don't create cycles.
 
 **Cross-module calls go through the module, not the name** — e.g. `motion.py`
 calls `camera.camera_get(...)` (via `from . import camera`), never
@@ -110,8 +186,13 @@ the name up on the module at call time. Preserve this pattern.
 | DELETE | `/devices/<id>` | remove device |
 | GET | `/channels?device=<id>` | discover cameras |
 | GET | `/snapshot?device=<id>&ch=<cid>&res=<WxH>` | one JPEG |
-| GET | `/motion?device=<id>&input=<n>` | current motion config |
+| GET | `/motion?device=<id>&input=<n>` | current motion config (detection area) |
 | POST | `/motion` `{device,input,cells,sensitivity}` | save motion area |
+| GET | `/motion/state?device=<id>` | live per-channel motion state `{ok,supported,message,channels:{input:bool}}` (from the alert stream) |
+| GET | `/settings` | app settings `{save_path}` |
+| PUT | `/settings` `{save_path}` | update settings (path `~`-expanded, made absolute) |
+| POST | `/save` `{device,ch}` | save a max-res (720p) JPEG to `save_path`, returns `{ok,path}` |
+| POST | `/reboot` `{device}` | reboot the whole device (`PUT /ISAPI/System/reboot`); per-device, drops all streams ~1 min |
 | GET | `/live/check?device=<id>` | pre-flight: ffmpeg present + RTSP port reachable |
 | GET | `/live?device=<id>&ch=<cid>&stream=main\|sub` | live MJPEG stream (RTSP→ffmpeg), runs until the browser disconnects |
 
@@ -161,6 +242,24 @@ python3 -m unittest discover -s tests -t .
 
 ## Device gotchas / hard-won facts (running log — append as you learn)
 
+- **`alertStream` only carries an event if its linkage has `center` ("Notify
+  Surveillance Center").** The live-motion indicator (`events.py`) reads
+  `/ISAPI/Event/notification/alertStream`; the DVR pushes a `VMD` event there
+  **only when the VMD trigger's `EventTriggerNotificationList` includes
+  `<notificationMethod>center</notificationMethod>`**. `record`/`email` linkages
+  fire independently but do **not** put the event on the stream. Symptom: motion
+  detection is enabled with a painted area, yet the stream shows only
+  `videoloss/inactive` keepalives and the app never badges. Fix = add a `center`
+  notification to `/ISAPI/Event/triggers/VMD-<n>` (read-modify-write, preserving
+  the existing `record`/`email` entries). Verified on the `home` DVR: after
+  adding `center`, `VMD/active` events appeared immediately. So **the app's motion
+  feature requires `center` to be enabled on each channel's VMD trigger** — this
+  is a device-side prerequisite, not something the app can synthesize.
+- **`/ISAPI/Event/triggers/VMD-<n>`** is the per-channel motion trigger
+  (`videoInputChannelID` = input 1..4); `/ISAPI/Event/triggers` lists them all.
+  Namespace here is `http://www.std-cgi.com/...` (not `hikvision.com`). Email SMTP
+  lives at `/ISAPI/System/Network/mailing`. An absent/disabled input returns 403
+  on its `motionDetection` (seen on `home` input 4).
 - **Out-of-range config write → 403 + write lockout.** Writing
   `sensitivityLevel=7` (max is 6) returned HTTP 403 *and* left the device
   rejecting **all** subsequent config PUTs with 403 for a while (GET still

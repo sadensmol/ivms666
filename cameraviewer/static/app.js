@@ -16,6 +16,7 @@ async function loadDevices() {
     setStatus('Loaded ' + devices.length + ' device(s).');
     devices.forEach(loadChannels);
     syncAuto();
+    startMotionPolling();
   } catch (e) { setStatus('Error loading devices: ' + e.message, true); }
 }
 
@@ -49,6 +50,16 @@ async function saveDevice() {
     await loadDevices();
   } catch (e) { $('devMsg').textContent = 'Error: ' + e.message; }
 }
+async function rebootDevice(d) {
+  if (!d) return;
+  if (!confirm('Reboot "'+(d.name||d.host)+'"? All its cameras go offline for ~1 minute.')) return;
+  setStatus('Rebooting '+(d.name||d.host)+'…');
+  try {
+    const r=await jfetch('/reboot',{method:'POST',body:JSON.stringify({device:d.id})});
+    if (!r.ok) { setStatus('Reboot failed: '+(r.message||'unknown'), true); return; }
+    setStatus('Reboot command sent to '+(d.name||d.host)+'. It will be offline briefly.');
+  } catch (e) { setStatus('Reboot failed: '+e.message, true); }
+}
 async function deleteDevice(d) {
   if (!confirm('Remove "' + (d.name||d.host) + '" and its saved credentials?')) return;
   try { await fetch('/devices/'+encodeURIComponent(d.id), {method:'DELETE'}); await loadDevices(); }
@@ -71,6 +82,8 @@ function renderDevices() {
       '<small>'+escapeHtml(d.host)+':'+escapeHtml(d.port)+(d.user?('  ·  '+escapeHtml(d.user)):'')+'</small>' +
       '<span class="grow"></span>' +
       '<button class="iconbtn" data-reset="'+d.id+'">'+(hiddenN?('Reset hidden ('+hiddenN+')'):'Reset hidden')+'</button>' +
+      '<button class="iconbtn" data-diag="'+d.id+'">Diagnose</button>' +
+      '<button class="iconbtn" data-reboot="'+d.id+'">Reboot</button>' +
       '<button class="iconbtn" data-edit="'+d.id+'">Edit</button>' +
       '<button class="iconbtn danger" data-del="'+d.id+'">Delete</button></div>' +
       '<div class="grid" data-grid="'+d.id+'"></div>';
@@ -79,9 +92,24 @@ function renderDevices() {
   root.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>openEditDevice(devices.find(x=>x.id===b.dataset.edit)));
   root.querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>deleteDevice(devices.find(x=>x.id===b.dataset.del)));
   root.querySelectorAll('[data-reset]').forEach(b=>b.onclick=()=>resetHidden(b.dataset.reset));
+  root.querySelectorAll('[data-reboot]').forEach(b=>b.onclick=()=>rebootDevice(devices.find(x=>x.id===b.dataset.reboot)));
+  root.querySelectorAll('[data-diag]').forEach(b=>b.onclick=()=>openDiagnose(devices.find(x=>x.id===b.dataset.diag)));
   // re-render tiles for devices already discovered
   for (const d of devices) if (chans[d.id]) buildTiles(d);
 }
+
+/* ---- per-tile settings menu (⚙) ---- */
+function closeTileMenus() {
+  document.querySelectorAll('.menu.open').forEach(m=>m.classList.remove('open'));
+}
+function toggleTileMenu(ev, grid, chId) {
+  ev.stopPropagation();
+  const menu = grid.querySelector('[data-menu="'+chId+'"]');
+  const wasOpen = menu.classList.contains('open');
+  closeTileMenus();
+  if (!wasOpen) menu.classList.add('open');
+}
+document.addEventListener('click', closeTileMenus);  // click anywhere else closes it
 
 function visibleChannels(d) {
   const hidden = new Set(d.hidden||[]);
@@ -109,19 +137,24 @@ function buildTiles(d) {
   const vis = visibleChannels(d);
   if (!vis.length) { grid.innerHTML='<div class="empty">No visible cameras.</div>'; }
   for (const ch of vis) {
-    const tile=document.createElement('div'); tile.className='tile';
+    const tile=document.createElement('div'); tile.className='tile'; tile.dataset.tile=ch.id;
     tile.innerHTML =
       '<div class="bar"><b>'+escapeHtml(ch.name)+'</b><small>id '+escapeHtml(ch.id)+'</small><span class="grow"></span>' +
       '<button class="iconbtn" data-live="'+ch.id+'">Live</button>' +
-      '<button class="iconbtn" data-motion="'+ch.id+'">Motion</button>' +
       '<button class="iconbtn" data-dl="'+ch.id+'">Save</button>' +
-      '<button class="iconbtn danger" data-remove="'+ch.id+'" title="Remove from view">✕</button></div>' +
-      '<img data-img="'+ch.id+'" alt=""><div class="msg" data-msg="'+ch.id+'">—</div>';
+      '<span class="tilemenu"><button class="iconbtn" data-settings="'+ch.id+'" title="Settings">⚙</button>' +
+        '<div class="menu" data-menu="'+ch.id+'">' +
+          '<button data-motion="'+ch.id+'">Motion detection area</button>' +
+          '<button class="danger" data-remove="'+ch.id+'">Hide this camera</button>' +
+        '</div></span></div>' +
+      '<img data-img="'+ch.id+'" alt=""><div class="msg" data-msg="'+ch.id+'">—</div>' +
+      '<div class="corners"></div>';
     grid.appendChild(tile);
   }
-  grid.querySelectorAll('[data-dl]').forEach(b=>b.onclick=()=>downloadTile(d,b.dataset.dl));
-  grid.querySelectorAll('[data-remove]').forEach(b=>b.onclick=()=>removeTile(d,b.dataset.remove));
-  grid.querySelectorAll('[data-motion]').forEach(b=>b.onclick=()=>openMotion(d,b.dataset.motion));
+  grid.querySelectorAll('[data-dl]').forEach(b=>b.onclick=()=>saveTile(d,b.dataset.dl));
+  grid.querySelectorAll('[data-remove]').forEach(b=>b.onclick=()=>{ closeTileMenus(); removeTile(d,b.dataset.remove); });
+  grid.querySelectorAll('[data-settings]').forEach(b=>b.onclick=e=>toggleTileMenu(e,grid,b.dataset.settings));
+  grid.querySelectorAll('[data-motion]').forEach(b=>b.onclick=()=>{ closeTileMenus(); openMotion(d,b.dataset.motion); });
   grid.querySelectorAll('[data-live]').forEach(b=>b.onclick=()=>openLive(d,b.dataset.live));
 }
 
@@ -147,12 +180,14 @@ async function captureTile(d, ch) {
 
 function refreshAll(){ for (const d of devices) visibleChannels(d).forEach(ch=>captureTile(d,ch)); }
 
-function downloadTile(d, id) {
-  const ch=(chans[d.id]||[]).find(c=>c.id===id);
-  if (!ch||!ch._blob) { setStatus('Nothing captured yet for '+id, true); return; }
-  const a=document.createElement('a'); a.href=URL.createObjectURL(ch._blob);
-  a.download='camera-'+(d.name||d.host)+'-'+id+'-'+new Date().toISOString().replace(/[:.]/g,'-')+'.jpg';
-  a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+async function saveTile(d, id) {
+  const msg=document.querySelector('[data-grid="'+d.id+'"] [data-msg="'+id+'"]');
+  if (msg) { msg.textContent='Saving…'; msg.className='msg'; }
+  try {
+    const r=await jfetch('/save',{method:'POST',body:JSON.stringify({device:d.id, ch:id})});
+    if (!r.ok) { if(msg){ msg.textContent='Save failed: '+(r.message||'unknown'); msg.className='msg err'; } return; }
+    if (msg) { msg.textContent='Saved!'; msg.className='msg'; }
+  } catch (e) { if(msg){ msg.textContent='Save failed: '+e.message; msg.className='msg err'; } }
 }
 
 async function persistHidden(d) {
@@ -174,6 +209,127 @@ function syncAuto() {
   if (timer) { clearInterval(timer); timer=null; }
   const secs=parseFloat($('interval').value);
   if ($('auto').checked && secs>0) timer=setInterval(refreshAll, secs*1000);
+}
+
+/* ---- motion indicator (per-camera, from the device alert stream) ---- */
+const motionState = {};   // deviceId -> { inputIndex: bool }
+let motionTimer = null;
+function startMotionPolling() {
+  if (motionTimer) clearInterval(motionTimer);
+  motionTimer = setInterval(pollMotion, 1500);
+  pollMotion();
+}
+async function pollMotion() {
+  for (const d of devices) {
+    try {
+      const s = await jfetch('/motion/state?device='+encodeURIComponent(d.id));
+      applyMotion(d, s.channels || {});
+    } catch (e) { /* transient — keep the last known state */ }
+  }
+}
+function applyMotion(d, channels) {
+  const prev = motionState[d.id] || {};
+  motionState[d.id] = channels;
+  for (const ch of (chans[d.id]||[])) {
+    const active = !!channels[String(ch.input)];
+    const tile = document.querySelector('[data-grid="'+d.id+'"] .tile[data-tile="'+ch.id+'"]');
+    if (tile) tile.classList.toggle('motion', active);
+    // fresh inactive->active: refresh the visible frame + pop the captured shot
+    if (active && !prev[String(ch.input)]) { captureTile(d, ch); showMotionPopup(d, ch); }
+  }
+}
+
+/* ---- motion popup: show the captured frame full-screen ---- */
+let motTimer = null;
+function anyOverlayOpen() {
+  return ['devOverlay','setOverlay','diagOverlay','liveOverlay','overlay'].some(id => $(id).classList.contains('open'));
+}
+function showMotionPopup(d, ch) {
+  if (anyOverlayOpen()) return;   // don't cover a modal the user already opened
+  $('motTitle').textContent = 'Motion — '+(d.name||d.host)+' / '+ch.name+'  ·  '+new Date().toLocaleTimeString();
+  // request the max-resolution still (what was saved to disk), not the view quality
+  $('motImg').src = '/snapshot?device='+encodeURIComponent(d.id)+'&ch='+encodeURIComponent(ch.id)+
+                    '&res=1280x720&ts='+Date.now();
+  $('motOverlay').classList.add('open');
+  if (motTimer) clearTimeout(motTimer);
+  motTimer = setTimeout(closeMotionPopup, 12000);   // auto-dismiss
+}
+function closeMotionPopup() {
+  if (motTimer) { clearTimeout(motTimer); motTimer=null; }
+  $('motOverlay').classList.remove('open'); $('motImg').removeAttribute('src');
+}
+
+/* ---- diagnose (motion -> email -> UI pipeline) ---- */
+let diagDev = null;
+async function openDiagnose(d) {
+  if (!d) return;
+  diagDev = d;
+  $('diagTitle').textContent = 'Diagnose — '+(d.name||d.host);
+  $('diagFix').style.display = 'none';
+  $('diagBody').innerHTML = '<div class="diagsum">Checking '+escapeHtml(d.name||d.host)+'…</div>';
+  $('diagOverlay').classList.add('open');
+  try {
+    const rep = await jfetch('/diagnose?device='+encodeURIComponent(d.id));
+    renderDiag(rep);
+  } catch (e) { $('diagBody').innerHTML = '<div class="chk bad">Error: '+escapeHtml(e.message)+'</div>'; }
+}
+function chk(ok, label) {
+  return '<div class="chk '+(ok?'ok':'bad')+'"><span class="ico">'+(ok?'✓':'✗')+'</span><span>'+escapeHtml(label)+'</span></div>';
+}
+function renderDiag(rep) {
+  if (rep.error) { $('diagBody').innerHTML = '<div class="chk bad">Error: '+escapeHtml(rep.error)+'</div>'; return; }
+  const issues = [].concat(...rep.channels.map(c=>c.issues||[]));
+  const problems = issues.length || !rep.smtp.ok;
+  let html = '<div class="diagsum">'+(problems
+    ? '⚠ '+issues.length+' issue(s) found.'
+    : '✓ All good — motion will e-mail and show in the app.')+'</div>';
+  // SMTP (device-wide)
+  html += '<div class="diagch"><h4>E-mail (SMTP)</h4>' +
+    chk(rep.smtp.ok, rep.smtp.ok
+      ? 'SMTP configured — '+rep.smtp.receivers+' recipient(s)'
+      : (rep.smtp.issue || 'SMTP not configured (set server + recipient on the DVR Email page)')) + '</div>';
+  for (const c of rep.channels) {
+    html += '<div class="diagch"><h4>'+escapeHtml(c.name)+' <small style="color:#9aa3af">id '+escapeHtml(c.id)+'</small></h4>';
+    if (!c.reachable) { html += chk(false, 'Not reachable / disabled input ('+escapeHtml(c.detail||'')+')') + '</div>'; continue; }
+    html += chk(c.motion_enabled, 'Motion detection enabled');
+    html += chk(c.area_painted, 'Detection area painted');
+    html += chk(c.email_linked, 'E-mail on motion (email linkage)');
+    html += chk(c.center_linked, 'Shows in app (Notify Surveillance Center)');
+    for (const i of (c.issues||[])) if (!i.fixable) html += '<div class="chk bad"><span class="ico">→</span><span>'+escapeHtml(i.msg)+'</span></div>';
+    html += '</div>';
+  }
+  $('diagBody').innerHTML = html;
+  $('diagFix').style.display = rep.fixable ? '' : 'none';
+}
+async function fixDiag() {
+  if (!diagDev) return;
+  $('diagFix').disabled = true; $('diagFix').textContent = 'Fixing…';
+  try {
+    const r = await jfetch('/diagnose/fix', {method:'POST', body:JSON.stringify({device:diagDev.id})});
+    if (!r.ok) { setStatus('Fix failed: '+(r.message||'unknown'), true); }
+    else {
+      const applied = (r.fixes||[]).map(f=>f.name+': +'+f.added.join(', ')).join('  ·  ');
+      setStatus(applied ? ('Fixed — '+applied) : 'Nothing to fix.');
+      renderDiag(r.report);
+      if (r.fixes && r.fixes.length) $('diagBody').insertAdjacentHTML('afterbegin',
+        '<div class="chk ok"><span class="ico">✓</span><span>Applied: '+escapeHtml(applied)+'</span></div>');
+    }
+  } catch (e) { setStatus('Fix failed: '+e.message, true); }
+  finally { $('diagFix').disabled = false; $('diagFix').textContent = 'Fix issues'; }
+}
+
+/* ---- settings (image save path) ---- */
+async function openSettings() {
+  $('setMsg').textContent=''; $('setMsg').className='mmsg';
+  try { const s=await jfetch('/settings'); $('setPath').value=s.save_path||''; }
+  catch (e) { $('setMsg').textContent='Error: '+e.message; $('setMsg').className='mmsg err'; }
+  $('setOverlay').classList.add('open');
+}
+async function saveSettings() {
+  try {
+    const s=await jfetch('/settings',{method:'PUT',body:JSON.stringify({save_path:$('setPath').value.trim()})});
+    $('setPath').value=s.save_path; $('setMsg').textContent='Saved: '+s.save_path; $('setMsg').className='mmsg ok';
+  } catch (e) { $('setMsg').textContent='Error: '+e.message; $('setMsg').className='mmsg err'; }
 }
 
 /* ---- live view (real-time RTSP -> MJPEG via ffmpeg) ---- */
@@ -275,12 +431,19 @@ async function saveMotion(){
 }
 
 $('addBtn').onclick=openAddDevice;
+$('settingsBtn').onclick=openSettings;
+$('setClose').onclick=()=>$('setOverlay').classList.remove('open');
+$('setSave').onclick=saveSettings;
+$('diagClose').onclick=()=>$('diagOverlay').classList.remove('open');
+$('diagFix').onclick=fixDiag;
 $('devClose').onclick=()=>$('devOverlay').classList.remove('open');
 $('devSave').onclick=saveDevice;
 $('refresh').onclick=refreshAll;
 $('auto').onchange=syncAuto; $('interval').onchange=syncAuto;
 $('liveClose').onclick=closeLive;
 $('liveSave').onclick=saveLiveFrame;
+$('motClose').onclick=closeMotionPopup;
+$('motOverlay').onclick=e=>{ if(e.target===$('motOverlay')) closeMotionPopup(); };
 (function(){ const q=localStorage.getItem('camquality'); if(q) $('quality').value=q; })();
 $('quality').onchange=()=>{ localStorage.setItem('camquality',$('quality').value); refreshAll(); };
 $('mclose').onclick=closeMotion; $('msave').onclick=saveMotion;

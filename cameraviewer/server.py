@@ -11,6 +11,13 @@ Routes:
     GET  /snapshot?device=<id>&ch=<cid>&res=<WxH>   a JPEG still
     GET  /motion?device=<id>&input=<n>              current motion config
     POST /motion  {device, input, cells, sensitivity}   save motion area
+    GET  /motion/state?device=<id>                  live motion state per channel
+    GET  /settings                                  app settings (image save path)
+    PUT  /settings  {save_path}                     update app settings
+    POST /save  {device, ch}                        save a max-res JPEG to disk
+    POST /reboot  {device}                          reboot the whole device (ISAPI)
+    GET  /diagnose?device=<id>                       audit motion->email->UI pipeline
+    POST /diagnose/fix  {device}                     auto-fix the fixable linkage gaps
 """
 
 import http.server
@@ -21,7 +28,7 @@ import urllib.error
 import webbrowser
 from urllib.parse import parse_qs, urlparse
 
-from . import camera, config, live, motion, web
+from . import camera, config, diagnose, events, live, motion, store, web
 
 _LIVE_FIRST_READ = 512   # bytes to wait for before declaring the stream alive
 _LIVE_CHUNK = 8192
@@ -68,6 +75,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/devices":
             self._json(200, config.list_devices())
+            return
+        if path == "/settings":
+            self._json(200, config.get_settings())
+            return
+        if path == "/motion/state":
+            device_id = self._query().get("device", "")
+            if not config.get_cfg(device_id):
+                self._send(404, "unknown device")
+                return
+            self._json(200, events.get_state(device_id))
+            return
+        if path == "/diagnose":
+            device_id = self._query().get("device", "")
+            cfg = config.get_cfg(device_id)
+            if not cfg:
+                self._send(404, "unknown device")
+                return
+            try:
+                self._json(200, diagnose.diagnose(cfg, config.get_hidden(device_id)))
+            except Exception as e:  # noqa: BLE001
+                self._json(200, {"error": self._explain(e)})
             return
         if path in ("/live", "/live/check"):
             cfg = self._cfg_from_query()
@@ -148,7 +176,58 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not p.get("host") or not p.get("port"):
                 self._send(400, "host and port are required")
                 return
-            self._json(200, config.add_device(p))
+            masked = config.add_device(p)
+            events.ensure(masked["id"])  # start watching the new device for motion
+            self._json(200, masked)
+            return
+        if path == "/save":
+            try:
+                p = self._read_json()
+            except json.JSONDecodeError:
+                self._json(200, {"ok": False, "message": "bad json"})
+                return
+            cfg = config.get_cfg(str(p.get("device", "")))
+            if not cfg:
+                self._json(200, {"ok": False, "message": "unknown device"})
+                return
+            try:
+                saved = store.save_snapshot(cfg, str(p.get("ch", "101")),
+                                            label=config.device_label(str(p.get("device", ""))))
+                self._json(200, {"ok": True, "path": saved})
+            except Exception as e:  # noqa: BLE001
+                self._json(200, {"ok": False, "message": self._explain(e)})
+            return
+        if path == "/diagnose/fix":
+            try:
+                p = self._read_json()
+            except json.JSONDecodeError:
+                self._json(200, {"ok": False, "message": "bad json"})
+                return
+            cfg = config.get_cfg(str(p.get("device", "")))
+            if not cfg:
+                self._json(200, {"ok": False, "message": "unknown device"})
+                return
+            try:
+                result = diagnose.apply_fixes(cfg)
+                self._json(200, {"ok": True, **result})
+            except Exception as e:  # noqa: BLE001
+                self._json(200, {"ok": False, "message": self._explain(e)})
+            return
+        if path == "/reboot":
+            try:
+                p = self._read_json()
+            except json.JSONDecodeError:
+                self._json(200, {"ok": False, "message": "bad json"})
+                return
+            cfg = config.get_cfg(str(p.get("device", "")))
+            if not cfg:
+                self._json(200, {"ok": False, "message": "unknown device"})
+                return
+            try:
+                ok, message = camera.reboot(cfg)
+                self._json(200, {"ok": ok, "message": message})
+            except Exception as e:  # noqa: BLE001
+                self._json(200, {"ok": False, "message": self._explain(e)})
             return
         if path == "/motion":
             try:
@@ -171,7 +250,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # --- PUT ---------------------------------------------------------------
     def do_PUT(self):
-        parts = urlparse(self.path).path.strip("/").split("/")
+        path = urlparse(self.path).path
+        if path == "/settings":
+            try:
+                p = self._read_json()
+            except json.JSONDecodeError:
+                self._send(400, "bad json")
+                return
+            self._json(200, config.update_settings(p))
+            return
+        parts = path.strip("/").split("/")
         if len(parts) == 2 and parts[0] == "devices":
             try:
                 p = self._read_json()
@@ -191,6 +279,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         parts = urlparse(self.path).path.strip("/").split("/")
         if len(parts) == 2 and parts[0] == "devices":
             config.delete_device(parts[1])
+            events.stop(parts[1])  # retire its motion monitor
             self._json(200, {"ok": True})
             return
         self._send(404, "not found")
@@ -215,6 +304,7 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 def run_gui():
     config.load()
+    events.start_all()  # begin watching every device for motion (works headless)
     url = f"http://{config.LISTEN_HOST}:{config.LISTEN_PORT}/"
     server = Server((config.LISTEN_HOST, config.LISTEN_PORT), Handler)
     print(f"Camera Viewer running at {url}")
