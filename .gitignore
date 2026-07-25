@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Local device config — contains camera credentials. Normally lives in $HOME,
+# but never commit it if it ends up in the repo (or CONFIG_PATH is changed).
+.camera_viewer.json
+camera_viewer.json
+*.tmp
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

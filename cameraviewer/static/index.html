@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Camera Viewer</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.4 -apple-system, Segoe UI, Roboto, sans-serif;
+         background: #12151a; color: #e6e8eb; }
+  header { padding: 12px 16px; background: #1a1e26; border-bottom: 1px solid #2a2f3a;
+           display: flex; align-items: center; gap: 12px; flex-wrap: wrap; position: sticky; top: 0; z-index: 20; }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .3px; }
+  .grow { flex: 1; }
+  header .ctl { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #9aa3af; }
+  input { background: #0e1116; border: 1px solid #2a2f3a; color: #e6e8eb;
+          padding: 7px 9px; border-radius: 6px; font-size: 13px; width: 100%; }
+  input.small { width: 78px; }
+  select { background: #0e1116; border: 1px solid #2a2f3a; color: #e6e8eb;
+           padding: 6px 8px; border-radius: 6px; font-size: 13px; }
+  button { background: #2f6feb; color: #fff; border: 0; padding: 8px 16px;
+           border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  button.secondary { background: #2a2f3a; }
+  button:active { transform: translateY(1px); }
+  .toggle { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+  .toggle input { width: auto; }
+
+  .device { border-bottom: 1px solid #20242e; }
+  .dhead { display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+           background: #161a21; position: sticky; top: 53px; z-index: 10; }
+  .dhead b { font-size: 14px; }
+  .dhead small { color: #9aa3af; }
+  .dhead .dot { width: 8px; height: 8px; border-radius: 50%; background: #6b7280; }
+  .dhead .dot.ok { background: #2ea043; } .dhead .dot.err { background: #d9534f; }
+  .grid { display: grid; gap: 14px; padding: 16px;
+          grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
+  .tile { background: #0e1116; border: 1px solid #2a2f3a; border-radius: 10px;
+          overflow: hidden; display: flex; flex-direction: column; }
+  .tile .bar { display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+               background: #161a21; border-bottom: 1px solid #2a2f3a; }
+  .tile .bar b { font-size: 13px; } .tile .bar small { color: #9aa3af; }
+  .tile .bar .grow { flex: 1; }
+  .tile img { width: 100%; aspect-ratio: 16/9; object-fit: contain; background: #0a0c0f; display: block; }
+  .tile .msg { padding: 8px 10px; font-size: 12px; color: #9aa3af; min-height: 30px; }
+  .tile .msg.err { color: #ff8080; }
+  .iconbtn { background: #2a2f3a; padding: 5px 10px; font-size: 12px; }
+  .iconbtn.danger { background: #3a2029; color: #ff9a9a; }
+  .empty { padding: 40px 16px; text-align: center; color: #9aa3af; }
+  .status { padding: 8px 16px; font-size: 12px; color: #9aa3af;
+            border-top: 1px solid #2a2f3a; background: #161a21; position: sticky; bottom: 0; }
+  .status.err { color: #ff8080; }
+
+  /* modals */
+  .overlay { position: fixed; inset: 0; background: rgba(5,7,10,.86);
+             display: none; align-items: center; justify-content: center; padding: 18px; z-index: 50; }
+  .overlay.open { display: flex; }
+  .modal { background: #12151a; border: 1px solid #2a2f3a; border-radius: 12px;
+           display: flex; flex-direction: column; max-width: 1100px; width: 100%; max-height: 92vh; }
+  .modal.narrow { max-width: 420px; }
+  .modal .mhead { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid #2a2f3a; }
+  .modal .mhead h2 { font-size: 15px; margin: 0; }
+  .form { padding: 16px; display: grid; gap: 12px; }
+  .form label { display: flex; flex-direction: column; gap: 4px; font-size: 11px;
+                color: #9aa3af; text-transform: uppercase; letter-spacing: .4px; }
+  .canvas-wrap { position: relative; margin: 16px auto; line-height: 0; max-width: 100%; }
+  .canvas-wrap img { max-width: 100%; max-height: 62vh; border-radius: 8px; display: block; }
+  .canvas-wrap canvas { position: absolute; inset: 0; cursor: crosshair; touch-action: none; }
+  .mfoot { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; padding: 12px 16px; border-top: 1px solid #2a2f3a; }
+  .mfoot .sens { display: flex; align-items: center; gap: 10px; }
+  .mfoot input[type=range] { width: 200px; }
+  .mmsg { font-size: 12px; color: #9aa3af; } .mmsg.err { color: #ff8080; } .mmsg.ok { color: #7ee787; }
+  .hint { font-size: 12px; color: #9aa3af; padding: 0 16px 4px; }
+  .modal.live { max-width: 96vw; }
+  .live-stage { display: flex; align-items: center; justify-content: center;
+                background: #000; border-radius: 0 0 12px 12px; overflow: hidden; }
+  .live-stage img { max-width: 96vw; max-height: 82vh; display: block; }
+  .lpill { font-size: 12px; color: #7ee787; background: #14261a; border: 1px solid #204a2c;
+           padding: 3px 8px; border-radius: 999px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📷 Camera Viewer</h1>
+  <button id="addBtn">+ Add camera</button>
+  <span class="grow"></span>
+  <span class="ctl">Quality
+    <select id="quality">
+      <option value="1280x720">HD 720p</option>
+      <option value="704x576">SD 704×576</option>
+    </select></span>
+  <span class="ctl">Refresh (s) <input id="interval" class="small" value="5"></span>
+  <label class="toggle"><input type="checkbox" id="auto" checked> auto</label>
+  <button id="refresh" class="secondary">Refresh all</button>
+  <span id="clock" style="font-size:12px;color:#9aa3af"></span>
+</header>
+
+<div id="devices"></div>
+<div class="status" id="status">Loading…</div>
+
+<!-- Add / edit device -->
+<div class="overlay" id="devOverlay">
+  <div class="modal narrow">
+    <div class="mhead"><h2 id="devTitle">Add camera</h2><span class="grow"></span>
+      <button class="secondary" id="devClose">Close</button></div>
+    <div class="form">
+      <label>Name <input id="dName" placeholder="e.g. Front NVR"></label>
+      <label>Host / IP <input id="dHost" placeholder="e.g. 192.168.1.64"></label>
+      <label>Port <input id="dPort" value="80" placeholder="80"></label>
+      <label>Username <input id="dUser" autocomplete="off"></label>
+      <label>Password <input id="dPass" type="password" autocomplete="off" placeholder=""></label>
+      <label>RTSP port <input id="dRtsp" value="554" placeholder="554"> <small style="text-transform:none;color:#9aa3af">for Live video — forward this on the router</small></label>
+      <div class="mfoot" style="padding:4px 0;border:0">
+        <span class="mmsg" id="devMsg"></span><span class="grow"></span>
+        <button id="devSave">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Live view -->
+<div class="overlay live" id="liveOverlay">
+  <div class="modal live">
+    <div class="mhead"><h2 id="liveTitle">Live</h2>
+      <span class="lpill" id="liveFps">—</span>
+      <small style="color:#9aa3af">main stream · HD</small>
+      <span class="grow"></span>
+      <button id="liveSave">Save frame</button>
+      <button class="secondary" id="liveClose">Close</button></div>
+    <div class="live-stage"><img id="liveImg" alt=""></div>
+    <div class="hint" id="liveMsg" style="padding:8px 16px"></div>
+  </div>
+</div>
+
+<!-- Motion editor -->
+<div class="overlay" id="overlay">
+  <div class="modal">
+    <div class="mhead"><h2 id="mtitle">Motion detection area</h2><span class="grow"></span>
+      <button class="secondary" id="mclose">Close</button></div>
+    <div class="hint">Drag on the image to paint the detection area (green = active).
+      Highlighted cells are what the device currently has set — verify they look right before saving.
+      Only the area and sensitivity change; e-mail and other linkage are left untouched.</div>
+    <div class="canvas-wrap" id="cwrap">
+      <img id="mimg" alt=""><canvas id="mcanvas"></canvas>
+    </div>
+    <div class="mfoot">
+      <button id="mselall" class="secondary">Select all</button>
+      <button id="mclear" class="secondary">Clear</button>
+      <div class="sens">Sensitivity <input type="range" id="msens" min="0" max="6" step="1" value="3"><span id="msensval">3</span> <small style="color:#9aa3af">(0 low – 6 high)</small></div>
+      <span class="grow"></span>
+      <span class="mmsg" id="mmsg"></span>
+      <button id="msave">Save to device</button>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
