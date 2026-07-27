@@ -25,11 +25,10 @@ def _safe(name):
     return name or "camera"
 
 
-def save_snapshot(cfg, channel_id, label="camera", motion=False):
-    """Fetch a max-resolution JPEG for a channel and write it to the configured
-    folder (created if missing). Returns the absolute file path. Raises on a
-    fetch or write error so the caller can surface it."""
-    _, data = camera.fetch_snapshot(cfg, channel_id, camera.MAX_STILL_RES)
+def save_bytes(data, channel_id, label="camera", motion=False):
+    """Write already-fetched JPEG bytes to the configured folder (created if
+    missing). Returns the absolute file path. Used for both ISAPI stills and
+    ffmpeg-grabbed RTSP frames."""
     folder = config.get_settings()["save_path"]
     os.makedirs(folder, exist_ok=True)
     suffix = "_motion" if motion else ""
@@ -43,3 +42,11 @@ def save_snapshot(cfg, channel_id, label="camera", motion=False):
     with open(path, "wb") as f:
         f.write(data)
     return path
+
+
+def save_snapshot(cfg, channel_id, label="camera", motion=False):
+    """Fetch a max-resolution JPEG for a channel and write it to the configured
+    folder. Returns the absolute file path. Raises on a fetch or write error so
+    the caller can surface it."""
+    _, data = camera.fetch_snapshot(cfg, channel_id, camera.MAX_STILL_RES)
+    return save_bytes(data, channel_id, label, motion)

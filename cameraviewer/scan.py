@@ -15,11 +15,15 @@ import ipaddress
 import re
 import secrets
 import socket
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
-from . import live
+from . import live, vendors
 
 STD_PORT = 554
+MAX_CHANNELS = 8   # DVRs are usually 4/8/16-ch; probe channels 1..this per found port
+# The per-vendor RTSP path schemas live in the `vendors` package (one module each);
+# add a device there, not here.
 
 
 def probe_rtsp(host, port, timeout=5):
@@ -126,11 +130,19 @@ def scan_hosts(hosts, ports, timeout=5, workers=64):
     return [r for r in results if r]
 
 
-def rtsp_link(host, port, channel_id="101", user=None, password=None):
-    """Build the rtsp:// link for a discovered port (main stream, channel 101),
-    reusing live.rtsp_url so URL/credential encoding stays identical."""
-    cfg = {"host": host, "rtsp_port": port, "user": user, "password": password}
-    return live.rtsp_url(cfg, channel_id)
+def rtsp_link(host, port, path="/Streaming/Channels/101", user=None, password=None):
+    """Build the rtsp:// link for a discovered port + stream `path`, reusing
+    live.rtsp_url so URL/credential encoding stays identical."""
+    cfg = {"kind": "rtsp", "host": host, "rtsp_port": port,
+           "user": user, "password": password, "path": path}
+    return live.rtsp_url(cfg, "rtsp")
+
+
+def _realm_from_detail(detail):
+    """The digest realm from a probe_rtsp detail line, e.g.
+    'RTSP/1.0 401 Unauthorized ("Embedded Net DVR")' -> 'Embedded Net DVR'."""
+    m = re.search(r"\(([^)]*)\)\s*$", detail or "")
+    return m.group(1).strip().strip('"') if m else ""
 
 
 # --- credential verification ------------------------------------------------
@@ -225,11 +237,12 @@ def _www_authenticate(resp):
     return ""
 
 
-def rtsp_describe(host, port, user, password, channel_id="101", timeout=5):
-    """DESCRIBE the stream path with digest/basic auth. Returns (code, detail):
-    code is the final RTSP status (200 = credentials accepted), detail the status
-    line or the failure reason (None code -> connection/socket error)."""
-    url = f"rtsp://{host}:{port}/Streaming/Channels/{channel_id}"
+def rtsp_describe(host, port, user, password, path="/Streaming/Channels/101", timeout=5):
+    """DESCRIBE a specific stream `path` with digest/basic auth. Returns (code, detail):
+    code is the final RTSP status — **200** = credentials accepted AND the path is a
+    real stream; **404** = credentials accepted but that path doesn't exist (wrong
+    schema); **401** = credentials rejected; None = connection/socket error."""
+    url = f"rtsp://{host}:{port}{path}"
 
     def _send(sock, cseq, auth=None):
         lines = [f"DESCRIBE {url} RTSP/1.0", f"CSeq: {cseq}",
@@ -259,73 +272,129 @@ def rtsp_describe(host, port, user, password, channel_id="101", timeout=5):
         s.close()
 
 
-def scan_and_verify(hosts, ports, creds, channel_id="101", timeout=5,
-                    workers=10, stop_on_first=True, on_host_done=None):
-    """Scan up to `workers` hosts in parallel (capped at min(workers, #hosts)).
-    Each host is handled by one thread that, sequentially: probes its ports for
-    RTSP and, on every RTSP port, verifies `creds` **one login/password at a
-    time** (never concurrent, so a single DVR isn't hammered — that risks a
-    failed-login lockout). Parallelism is strictly across *different* hosts.
+def _chunks(seq, size):
+    for i in range(0, len(seq), max(1, size)):
+        yield seq[i:i + size]
 
-    Returns a flat list of hit dicts in input-host order:
-      {"host", "port", "detail", "working": [(user, password, detail), ...]}
-    `on_host_done(done_count, total, hits)` fires as each host finishes (progress).
+
+def scan_and_verify(hosts, ports, creds, timeout=5, workers=10, verify_workers=None,
+                    on_found=None, on_attempt=None, on_verified=None, on_host_done=None):
+    """Scan a **window of up to `workers` IPs at a time, PORT BY PORT**: probe port 1
+    on all IPs in the window in parallel, then port 2 on the same IPs, … up to the
+    last configured port; then advance to the next window of IPs.
+
+    **Verification runs on a SEPARATE pool** (`verify_workers`, default = `workers`):
+    the instant a port answers RTSP, its credential + stream probing (`probe_streams`
+    — which can be slow: many logins × vendor paths × channels) is handed to the
+    verify pool and the scan **keeps probing IPs** — a single slow/hanging device
+    never freezes the whole scan. Credentials for one host are still tried one at a
+    time (no per-host lockout); different hosts verify concurrently.
+
+    Live callbacks (the caller serializes output):
+      `on_found(host, port, detail)`  — the instant an RTSP port is detected
+      `on_attempt(host, port, i, n, user, password)` — before each login attempt
+      `on_verified(hit)`              — after that port's streams are enumerated
+      `on_host_done(done, total, hits)` — as each host's PROBING finishes (progress)
+
+    Returns a flat list of hit dicts:
+      {"host", "port", "detail", "streams": [(user, password, path, vendor), ...]}
+    — one entry per working camera/stream on that port.
     """
-    def _process(host):
-        hits = []
-        for port in ports:
-            ok, detail = probe_rtsp(host, port, timeout)
-            if not ok:
-                continue
-            working = (probe_credentials(host, port, creds, channel_id, timeout,
-                                         stop_on_first=stop_on_first) if creds else [])
-            hits.append({"host": host, "port": port, "detail": detail, "working": working})
-        return hits
-
     total = len(hosts)
-    n = min(workers, total) or 1
-    per_host = [None] * total
-    with ThreadPoolExecutor(max_workers=n) as ex:
-        futs = {ex.submit(_process, h): i for i, h in enumerate(hosts)}
-        done = 0
-        for fut in as_completed(futs):
-            i = futs[fut]
-            per_host[i] = fut.result()
-            done += 1
-            if on_host_done:
-                on_host_done(done, total, per_host[i])
-    return [hit for host_hits in per_host if host_hits for hit in host_hits]
+    win = max(1, min(workers, total))
+    verify_workers = verify_workers if verify_workers is not None else win
+    all_hits = []
+    lock = threading.Lock()
+    done = [0]
+
+    def _verify(host, port, detail):
+        attempt_cb = ((lambda i, n, u, p: on_attempt(host, port, i, n, u, p)) if on_attempt else None)
+        streams = probe_streams(host, port, creds, realm=_realm_from_detail(detail),
+                                timeout=timeout, on_attempt=attempt_cb)
+        hit = {"host": host, "port": port, "detail": detail, "streams": streams}
+        if on_verified:                       # (fired outside `lock` -> no nested-lock deadlock)
+            on_verified(hit)
+        with lock:
+            all_hits.append(hit)
+
+    with ThreadPoolExecutor(max_workers=win) as probe_ex, \
+            ThreadPoolExecutor(max_workers=max(1, verify_workers)) as verify_ex:
+        futs = []
+        for window in _chunks(hosts, win):
+            for port in ports:                              # port-major within the window
+                probed = list(probe_ex.map(
+                    lambda h, _pt=port: (h, *probe_rtsp(h, _pt, timeout)), window))
+                for host, ok, detail in probed:
+                    if not ok:
+                        continue
+                    if on_found:
+                        on_found(host, port, detail)
+                    if creds:                               # verify in the background; DON'T block probing
+                        futs.append(verify_ex.submit(_verify, host, port, detail))
+                    else:
+                        with lock:
+                            all_hits.append({"host": host, "port": port, "detail": detail, "streams": []})
+            for _ in window:                                # window probed -> advance host progress now
+                with lock:
+                    done[0] += 1
+                    d = done[0]
+                if on_host_done:
+                    on_host_done(d, total, [])
+        for f in futs:                                      # drain outstanding verifications
+            f.result()
+    return all_hits
 
 
-def device_entry(host, rtsp_port, user, password, http_port="80", name=None):
-    """Shape a verified scan hit into an import-ready device dict (the same shape
-    the app stores). The HTTP/ISAPI `port` (snapshots + motion) can't be found by
-    an RTSP scan, so it defaults to 80 — adjust after import if the DVR's web port
-    differs. Written by `rtsp-scan --output`, consumed by `import`."""
-    return {"name": name or f"cam {host}", "host": host, "port": str(http_port),
-            "user": user, "password": password, "rtsp_port": str(rtsp_port)}
+def device_entry(host, rtsp_port, user=None, password=None, path="/Streaming/Channels/101"):
+    """An import-ready entry for a verified stream, in the current config shape: a
+    single `rtsp_url` that `import` parses into an RTSP-only device (host/rtsp_port/
+    user/password/path). Credentials, if any, are embedded in the URL; `path` is the
+    verified stream path. Written by `rtsp-scan --output`, consumed by `import`."""
+    return {"rtsp_url": rtsp_link(host, rtsp_port, path, user=user, password=password)}
 
 
-def probe_credentials(host, port, creds, channel_id="101", timeout=5,
-                      stop_on_first=True, on_attempt=None):
-    """Try each (user, password) in `creds` against a known-RTSP host:port, one
-    at a time in the given order (login 1 with every password, then login 2, ...).
-    Sequential on purpose: many DVRs lock the account/IP after a burst of failed
-    logins, so we don't hammer with concurrent attempts. By default `stop_on_first`
-    returns as soon as one credential is accepted (a port needs only one working
-    login) — set it False to collect every accepted credential.
-
-    `on_attempt(index, total, user, password)` (1-based index) is called just
-    before each attempt, so a caller can render progress. Returns the accepted
-    ones as (user, password, detail)."""
-    working = []
+def find_credential(host, port, creds, probe_path="/Streaming/Channels/101",
+                    timeout=5, on_attempt=None):
+    """Find ONE accepted credential for a known-RTSP host:port. Tries each
+    (user, password) in order, ONE at a time (sequential -> no failed-login
+    lockout), stopping at the first that works. A credential is "accepted" the
+    moment answering the 401 challenge yields anything but another 401 (200 = valid
+    path, 404 = valid login / wrong path). Returns (user, password) or None.
+    `on_attempt(i, n, user, password)` (1-based) fires before each try."""
     total = len(creds)
     for i, (user, password) in enumerate(creds, 1):
         if on_attempt:
             on_attempt(i, total, user, password)
-        code, detail = rtsp_describe(host, port, user, password, channel_id, timeout)
-        if code == 200:
-            working.append((user, password, detail))
-            if stop_on_first:
-                break
-    return working
+        code, _ = rtsp_describe(host, port, user, password, probe_path, timeout)
+        if code is None:
+            return None                 # connection died -> stop trying this port
+        if code != 401:                 # got past auth -> this login works
+            return (user, password)
+    return None
+
+
+def probe_streams(host, port, creds, realm="", timeout=5, on_attempt=None,
+                  max_channels=MAX_CHANNELS):
+    """Enumerate every working stream on a found RTSP port, vendor- and
+    channel-aware:
+      1. infer the vendor from the 401 `realm` (`vendors.detect`);
+      2. find ONE working credential (sequential; `on_attempt` per try);
+      3. with it, walk vendors in best-guess order (`vendors.enumeration_order`) and
+         let each enumerate its channels (stopping at the first empty channel) —
+         the first vendor that yields any stream wins.
+    Returns [(user, password, path, vendor_name), …] — one per camera/stream."""
+    guess = vendors.detect(realm)
+    probe_path = guess.probe_path() if guess else "/Streaming/Channels/101"
+    got = find_credential(host, port, creds, probe_path, timeout, on_attempt)
+    if not got:
+        return []
+    user, password = got
+
+    def describe(path):
+        return rtsp_describe(host, port, user, password, path, timeout)[0]
+
+    for vendor in vendors.enumeration_order(realm):
+        paths = vendor.streams(describe, max_channels)
+        if paths:
+            return [(user, password, p, vendor.name) for p in paths]
+    return []

@@ -1,8 +1,64 @@
 """RTSP URL building and live-view pre-flight checks."""
 
+import io
 import unittest
 
 from cameraviewer import live
+
+
+class _CapturePopen:
+    """Captures the ffmpeg argv and returns a fake process emitting one JPEG."""
+    last_cmd = None
+
+    def __init__(self, cmd, **kw):
+        _CapturePopen.last_cmd = cmd
+        self.stdout = io.BytesIO(b"\xff\xd8jpeg\xff\xd9")
+        self.stderr = io.BytesIO(b"")
+
+    def communicate(self, timeout=None):
+        return self.stdout.read(), b""
+
+
+class AspectRatioTest(unittest.TestCase):
+    def _cmd_for(self, **kw):
+        orig = live.subprocess.Popen
+        live.subprocess.Popen = _CapturePopen
+        try:
+            live.grab_still("rtsp://x/1", **kw)
+        finally:
+            live.subprocess.Popen = orig
+        return _CapturePopen.last_cmd
+
+    def test_grab_still_forces_square_pixels(self):
+        cmd = self._cmd_for()
+        vf = cmd[cmd.index("-vf") + 1]
+        self.assertIn("setsar=1", vf)          # anamorphic (SAR!=1) sources de-squished
+
+    def test_grab_still_thumbnail_scales_after_square_correction(self):
+        cmd = self._cmd_for(width=480)
+        vf = cmd[cmd.index("-vf") + 1]
+        self.assertIn("setsar=1", vf)
+        self.assertIn("scale=480:-2", vf)      # width scale applied on top of the correction
+
+
+class AudioOnlyTest(unittest.TestCase):
+    def test_no_video_detects_audio_only(self):
+        self.assertTrue(live.no_video(
+            "[out#0/mjpeg @ 0x1] Output file does not contain any stream"))
+        self.assertTrue(live.no_video("Output file is empty, nothing was encoded"))
+        self.assertFalse(live.no_video("Error during demuxing: Operation timed out"))
+
+    def test_open_audio_builds_mp3_command(self):
+        orig = live.subprocess.Popen
+        live.subprocess.Popen = _CapturePopen
+        try:
+            live.open_audio("rtsp://x/1")
+        finally:
+            live.subprocess.Popen = orig
+        cmd = _CapturePopen.last_cmd
+        self.assertIn("-vn", cmd)                       # drop video (there is none)
+        self.assertEqual(cmd[cmd.index("-f") + 1], "mp3")
+        self.assertIn("libmp3lame", cmd)               # re-encode G.711 -> browser-playable MP3
 
 
 class RtspUrlTest(unittest.TestCase):
@@ -28,6 +84,20 @@ class RtspUrlTest(unittest.TestCase):
     def test_default_port(self):
         cfg = {"host": "h", "user": "u", "password": "p"}
         self.assertIn(":554/", live.rtsp_url(cfg, "101"))
+
+    def test_url_only_device_uses_stored_url_verbatim(self):
+        cfg = {"kind": "rtsp", "rtsp_url": "rtsp://u:p@cam.local:8554/live/0"}
+        # channel/stream are ignored — the user's URL is used as-is
+        self.assertEqual(live.rtsp_url(cfg, "101", "sub"), "rtsp://u:p@cam.local:8554/live/0")
+
+    def test_host_port_parsed_from_stored_url(self):
+        self.assertEqual(
+            live._host_port({"kind": "rtsp", "rtsp_url": "rtsp://u:p@cam.local:8554/live"}),
+            ("cam.local", 8554))
+        # no explicit port -> RTSP default
+        self.assertEqual(
+            live._host_port({"kind": "rtsp", "rtsp_url": "rtsp://cam.local/live"}),
+            ("cam.local", 554))
 
 
 class CheckTest(unittest.TestCase):

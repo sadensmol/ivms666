@@ -8,6 +8,7 @@ natively. ffmpeg is an external binary (the one non-stdlib dependency, used only
 while a Live window is open).
 """
 
+import re
 import shutil
 import socket
 import subprocess
@@ -15,6 +16,15 @@ from urllib.parse import quote
 
 # ffmpeg's mpjpeg muxer frames each JPEG with a `--ffmpeg` boundary.
 MJPEG_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=ffmpeg"
+AUDIO_CONTENT_TYPE = "audio/mpeg"   # streamed MP3 for an <audio> player (audio-only streams)
+
+
+def no_video(stderr):
+    """True when ffmpeg found no video track to map (the stream is audio/metadata
+    only — the DVR's SDP has no `m=video`). Such a still grab fails with 'Output
+    file does not contain any stream'."""
+    low = (stderr or "").lower()
+    return "does not contain any stream" in low or "output file is empty" in low
 
 
 def ffmpeg_available():
@@ -35,13 +45,37 @@ def _sub_channel(channel_id):
 
 
 def rtsp_url(cfg, channel_id, stream="main"):
-    """Build the Hikvision RTSP URL. Credentials are URL-encoded so passwords
-    containing '#', '@', ':' etc. don't corrupt the URL."""
-    cid = _sub_channel(channel_id) if stream == "sub" else str(channel_id)
+    """The RTSP URL to stream. Credentials are URL-encoded so '#', '@', ':' in a
+    password don't corrupt the URL.
+      - legacy `rtsp_url` present -> used verbatim;
+      - RTSP-only device (kind=rtsp) -> compose with its stored `path` (verbatim,
+        NOT assumed to be /Streaming/Channels/<id>);
+      - otherwise the Hikvision channel URL."""
+    if cfg.get("rtsp_url"):
+        return cfg["rtsp_url"]
     user = cfg.get("user") or ""
     pw = cfg.get("password") or ""
     cred = f"{quote(user, safe='')}:{quote(pw, safe='')}@" if user else ""
-    return f"rtsp://{cred}{cfg['host']}:{rtsp_port(cfg)}/Streaming/Channels/{cid}"
+    base = f"rtsp://{cred}{cfg['host']}:{rtsp_port(cfg)}"
+    if cfg.get("kind") == "rtsp":
+        path = cfg.get("path") or "/"
+        return base + (path if path.startswith("/") else "/" + path)
+    cid = _sub_channel(channel_id) if stream == "sub" else str(channel_id)
+    return f"{base}/Streaming/Channels/{cid}"
+
+
+def _host_port(cfg):
+    """(host, port) to probe for reachability — parsed from the stored URL for a
+    URL-only device, else the ISAPI host + rtsp_port."""
+    url = cfg.get("rtsp_url")
+    if url:
+        # (?:[^/]*@)? skips the whole userinfo (greedy to the LAST '@'), so a
+        # password containing '@'/':' isn't mistaken for the host:port.
+        m = re.search(r"://(?:[^/]*@)?([^:/]+)(?::(\d+))?", url)
+        if m:
+            return m.group(1), int(m.group(2) or 554)
+        return "", 554
+    return cfg["host"], int(rtsp_port(cfg))
 
 
 def check(cfg):
@@ -49,17 +83,48 @@ def check(cfg):
     Returns (ok, message) so the UI can show a clear reason before streaming."""
     if not ffmpeg_available():
         return False, "ffmpeg is not installed on the server (e.g. `brew install ffmpeg`)"
-    port = rtsp_port(cfg)
+    host, port = _host_port(cfg)
     s = socket.socket()
     s.settimeout(5)
     try:
-        s.connect((cfg["host"], int(port)))
+        s.connect((host, port))
         return True, "ok"
     except Exception as e:  # noqa: BLE001
-        return False, (f"cannot reach RTSP at {cfg['host']}:{port} ({type(e).__name__}) — "
-                       f"forward TCP {port} on the router to the DVR")
+        return False, (f"cannot reach RTSP at {host}:{port} ({type(e).__name__}) — "
+                       f"check the URL / forward TCP {port} on the router")
     finally:
         s.close()
+
+
+def grab_still(url, width=None, timeout=15):
+    """One JPEG frame from an RTSP URL (poster / Save for a URL-only RTSP device).
+    Not cached — a live stream's frame changes. Returns (jpeg_bytes, stderr)."""
+    vf = _SQUARE_PIXELS + (f",scale={int(width)}:-2" if width else "")
+    cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-rtsp_transport", "tcp",
+           "-timeout", RTSP_TIMEOUT_US, "-i", url, "-frames:v", "1", "-q:v", "4",
+           "-vf", vf, "-f", "mjpeg", "-"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()
+    return out, (err or b"").decode("utf-8", "replace")
+
+
+# RTSP socket I/O timeout (microseconds) so a dead/blocked stream — DESCRIBE
+# answers but no media flows (RTP not forwarded through NAT, wrong path) — fails
+# fast with "Operation timed out" instead of hanging. A working stream delivers a
+# keyframe in a few seconds, well under this. (This ffmpeg build uses `-timeout`;
+# older builds used `-stimeout` — not `-rw_timeout`, which errors here.)
+RTSP_TIMEOUT_US = "10000000"  # 10s
+
+# Force square-pixel output using the source's own metadata: multiply the coded
+# width by the sample aspect ratio (SAR) and mark the result 1:1. A stream with
+# non-square pixels (SAR != 1 — common on D1/analog and some RTSP cameras) would
+# otherwise be displayed SQUISHED, since a JPEG/<img> has no SAR to correct it.
+# When SAR is unknown ffmpeg treats it as 1, so square sources are unchanged.
+_SQUARE_PIXELS = "scale='trunc(iw*sar/2)*2':ih,setsar=1"
 
 
 def open_mjpeg(url, fps=15, quality=5):
@@ -67,12 +132,31 @@ def open_mjpeg(url, fps=15, quality=5):
     stdout. Returns the Popen. Caller must terminate() it when the client leaves."""
     cmd = [
         "ffmpeg", "-nostdin", "-loglevel", "error",
-        "-rtsp_transport", "tcp",
+        "-rtsp_transport", "tcp", "-timeout", RTSP_TIMEOUT_US,
         "-i", url,
         "-an",                       # no audio
         "-r", str(fps),
         "-q:v", str(quality),        # 2 (best) .. 31 (worst)
+        "-vf", _SQUARE_PIXELS,       # correct aspect (SAR) so the stream isn't squished
         "-f", "mpjpeg", "-",
+    ]
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def open_audio(url):
+    """Spawn ffmpeg to read an RTSP **audio** track (over TCP) and emit a streamed
+    MP3 on stdout, for a browser <audio> player. Used for audio-only streams (no
+    `m=video`) — e.g. a DVR channel whose video encoder is off but audio flows.
+    The DVR's audio is typically G.711 (pcm_mulaw); we re-encode to MP3 so every
+    browser can play it. Returns the Popen; caller terminate()s it on disconnect."""
+    cmd = [
+        "ffmpeg", "-nostdin", "-loglevel", "error",
+        "-rtsp_transport", "tcp", "-timeout", RTSP_TIMEOUT_US,
+        "-i", url,
+        "-vn",                       # no video (there is none)
+        "-c:a", "libmp3lame", "-b:a", "64k", "-ac", "1",
+        "-flush_packets", "1",       # low-latency streaming
+        "-f", "mp3", "-",
     ]
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 

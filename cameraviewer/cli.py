@@ -2,6 +2,7 @@
 
 import argparse
 import sys
+import threading
 
 from . import camera, config, scan
 from .server import run_gui
@@ -22,15 +23,13 @@ def _csv(s):
     return [x.strip() for x in s.split(",") if x.strip()]
 
 
-# Same-line scan progress: rewrite the current line with '\r' so it updates in
-# place ("scanning 45 of 199 hosts  (3 RTSP found)"). Hosts run in parallel, so
-# progress is per host (not per credential). _clear_progress wipes it before the
-# results are printed on their own lines.
-_PROGRESS_WIDTH = 72
+# Same-line progress: rewrite the current line with '\r' so it updates in place.
+# _clear_progress wipes it before a permanent line (a found RTSP / a result) is
+# printed on its own line, then the progress line re-renders on the next update.
+_PROGRESS_WIDTH = 110
 
 
-def _scan_progress(done, total, rtsp):
-    msg = f"    scanning {done} of {total} hosts  ({rtsp} RTSP found)"
+def _progress(msg):
     sys.stdout.write("\r" + msg[:_PROGRESS_WIDTH].ljust(_PROGRESS_WIDTH))
     sys.stdout.flush()
 
@@ -38,6 +37,40 @@ def _scan_progress(done, total, rtsp):
 def _clear_progress():
     sys.stdout.write("\r" + " " * _PROGRESS_WIDTH + "\r")
     sys.stdout.flush()
+
+
+class _LiveRegion:
+    """A bottom-anchored, multi-line status region that redraws in place (ANSI).
+    Permanent lines scroll ABOVE it via print_above(); the live block below shows
+    one line per host currently being verified plus a host-progress line. On a
+    non-tty (piped/redirected) all cursor control is skipped so output stays a
+    clean sequence of permanent lines."""
+
+    def __init__(self):
+        self.tty = sys.stdout.isatty()
+        self.n = 0  # number of live lines currently drawn
+
+    def render(self, lines):
+        if not self.tty:
+            return
+        out = f"\033[{self.n}A" if self.n else ""   # up to the region's top line
+        out += "\033[0J"                            # clear from cursor to end of screen
+        out += "".join(line[:240] + "\n" for line in lines)  # redraw the block
+        sys.stdout.write(out)
+        sys.stdout.flush()
+        self.n = len(lines)
+
+    def print_above(self, text):
+        if self.tty and self.n:
+            sys.stdout.write(f"\033[{self.n}A\033[0J")  # erase the live block first
+            self.n = 0
+        print(text)
+
+    def clear(self):
+        if self.tty and self.n:
+            sys.stdout.write(f"\033[{self.n}A\033[0J")
+            sys.stdout.flush()
+        self.n = 0
 
 
 def run_rtsp_scan(ns):
@@ -71,63 +104,81 @@ def run_rtsp_scan(ns):
             print(f"bad range: {e}")
             return 2
         target = ", ".join(specs)
+    # --- Windowed scan: a window of `workers` IPs is scanned port-by-port (each
+    # port probed across all IPs in the window at once), then the next window of
+    # IPs. Credentials are verified the instant a port answers. All output is
+    # serialized through `lock` so live lines don't interleave. ---
     workers = min(ns.parallel, len(hosts)) or 1
     print(f"Scanning {len(hosts)} host(s) x {len(ports)} port(s) on {target} "
-          f"({workers} in parallel) ...")
-    # Probe + verify up to `workers` hosts concurrently; credentials are still
-    # tried one at a time within each host. Progress is per host on one line.
-    rtsp_seen = [0]
+          f"({workers} IP(s) per window, one port at a time; credentials checked the instant a port is found) ...")
+    lock = threading.Lock()
+    region = _LiveRegion()
+    active = {}  # (host, port) currently verifying -> its live "trying …" line
+    stats = {"rtsp": 0, "ok": 0, "streams": 0, "hosts": 0, "total": len(hosts)}
+
+    def _lines():
+        # one live line per host being verified, then the host-search progress line
+        return list(active.values()) + [
+            f"    {stats['hosts']}/{stats['total']} hosts · "
+            f"{stats['rtsp']} RTSP · {stats['ok']} verified · {stats['streams']} stream(s)"]
+
+    def on_found(host, port, detail):
+        with lock:
+            stats["rtsp"] += 1
+            region.print_above(f"  ✓ RTSP   {host}:{port}   {detail}")
+            active[(host, port)] = f"      {host}:{port}  starting credential check…"
+            region.render(_lines())
+
+    def on_attempt(host, port, i, n, user, password):
+        with lock:
+            active[(host, port)] = f"      {host}:{port}  trying {user}:{password}  ({i}/{n})"
+            region.render(_lines())
+
+    def on_verified(hit):
+        with lock:
+            active.pop((hit["host"], hit["port"]), None)
+            entries = []
+            if hit["streams"]:
+                stats["ok"] += 1
+                stats["streams"] += len(hit["streams"])
+                u, p, _, vendor = hit["streams"][0]
+                region.print_above(f"  → login OK   {hit['host']}:{hit['port']}   {u}:{p}   "
+                                   f"[{vendor}]   {len(hit['streams'])} stream(s):")
+                for su, sp, path, _v in hit["streams"]:
+                    region.print_above(f"       {scan.rtsp_link(hit['host'], hit['port'], path, user=su, password=sp)}")
+                    entries.append(scan.device_entry(hit["host"], hit["port"], su, sp, path))
+            elif creds:
+                region.print_above(f"  → no login/streams   {hit['host']}:{hit['port']}   "
+                                   f"({len(creds)} combo(s) tried)")
+            else:
+                entries.append(scan.device_entry(hit["host"], hit["port"]))   # no-creds -> anonymous default
+            if entries:                                                        # append to the output file NOW
+                config.merge_devices_file(ns.output, entries)
+            region.render(_lines())
 
     def on_host_done(done, total, hits):
-        rtsp_seen[0] += len(hits)
-        _scan_progress(done, total, rtsp_seen[0])
+        with lock:
+            stats["hosts"] = done
+            region.render(_lines())
 
-    found = scan.scan_and_verify(hosts, ports, creds, timeout=ns.timeout,
-                                 workers=workers, on_host_done=on_host_done)
-    _clear_progress()
+    found = scan.scan_and_verify(hosts, ports, creds, timeout=ns.timeout, workers=workers,
+                                 on_found=on_found, on_attempt=on_attempt,
+                                 on_verified=on_verified, on_host_done=on_host_done)
+    region.clear()
     if not found:
         print(f"No RTSP found (ports tried: {', '.join(ports)}).")
         return 1
-    print(f"RTSP found ({len(found)}):")
-    devices = []  # verified hits, shaped for the output file / `import`
-    for hit in found:
-        host, port, working = hit["host"], hit["port"], hit["working"]
-        print(f"  {host}:{port}  {hit['detail']}")
-        if not creds:
-            # No credential lists -> just print an anonymous stream link (old behavior).
-            print(f"    {scan.rtsp_link(host, port)}")
-            continue
-        if not working:
-            print(f"    no working credentials ({len(creds)} combo(s) tried)")
-            continue
-        for user, password, status in working:
-            link = scan.rtsp_link(host, port, user=user, password=password)
-            print(f"    OK {user}:{password}  ({status})")
-            print(f"       {link}")
-        # One device per found port, using the first credential that worked.
-        u, p, _ = working[0]
-        devices.append(scan.device_entry(host, port, u, p))
 
-    # Full summary to stdout: every field that goes into the output file, so the
-    # console alone tells you exactly what was found and how to reach it.
-    print(f"\nDevices found ({len(devices)}):")
-    if not devices:
-        print("  (none — no port had a working login/password)")
-    for i, d in enumerate(devices, 1):
-        print(f"  {i}. {d['name']}")
-        print(f"       host:      {d['host']}")
-        print(f"       http port: {d['port']}  (ISAPI/snapshots — default; edit if the web port differs)")
-        print(f"       rtsp port: {d['rtsp_port']}")
-        print(f"       login:     {d['user']}")
-        print(f"       password:  {d['password']}")
-        print(f"       rtsp url:  {scan.rtsp_link(d['host'], d['rtsp_port'], user=d['user'], password=d['password'])}")
-
-    # Always emit the output file (independent of default_config.json). It is the
-    # setup input for the app: `import --file <output>` loads it into the internal
-    # config (~/.camera_viewer.json).
-    config.write_devices_file(ns.output, devices)
-    print(f"\nWrote {len(devices)} device(s) to {ns.output} "
-          f"— set them up with:  python3 -m cameraviewer import --file {ns.output}")
+    # Each verified hit was already appended to the output file live (on_verified,
+    # merged with whatever was there before — a re-run adds to it, never wipes it).
+    # Print a compact final summary of the file's current contents (creds masked).
+    merged = config.read_devices_file(ns.output)
+    print(f"\n{stats['rtsp']} RTSP port(s) found · {stats['ok']} with a working login · "
+          f"{stats['streams']} stream(s) enumerated.")
+    print(f"{ns.output} now holds {len(merged)} stream(s) (new appended, existing kept):")
+    for i, e in enumerate(merged, 1):
+        print(f"  {i}. {config.strip_url_creds(e.get('rtsp_url', '') or e.get('host', ''))}")
+    print(f"\nImport into the app:  python3 -m cameraviewer import --file {ns.output}")
     return 0
 
 
@@ -172,15 +223,27 @@ def main(argv=None):
     r.add_argument("--output", "-o", default="rtsp-scan-output.json",
                    help="JSON file to write verified devices to; feed it to "
                         "`import` to set up the app (default: rtsp-scan-output.json)")
-    r.add_argument("--parallel", type=int, default=10,
-                   help="how many hosts to probe/verify at once (capped at the host "
-                        "count; credentials are still tried one at a time per host) [10]")
+    r.add_argument("--parallel", type=int, default=25,
+                   help="window size — how many IPs to probe at once on each port "
+                        "(one port at a time across the window; credentials still "
+                        "tried one at a time per host) [25]")
     r.add_argument("--timeout", type=float, default=5.0)
 
     i = sub.add_parser("import", help="load devices from an rtsp-scan output file into the app")
     i.add_argument("--file", "-f", required=True, help="JSON file written by `rtsp-scan --output`")
 
     ns = parser.parse_args(argv)
+    try:
+        _dispatch(ns)
+    except KeyboardInterrupt:
+        # Ctrl+C during a scan: exit cleanly instead of dumping a thread-pool
+        # traceback (in-flight probes finish on their own socket timeout).
+        _clear_progress()
+        print("\nInterrupted.")
+        sys.exit(130)
+
+
+def _dispatch(ns):
     if ns.cmd == "discover":
         run_discover(ns)
     elif ns.cmd == "rtsp-scan":

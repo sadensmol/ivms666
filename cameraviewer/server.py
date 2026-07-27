@@ -18,6 +18,9 @@ Routes:
     POST /reboot  {device}                          reboot the whole device (ISAPI)
     GET  /diagnose?device=<id>                       audit motion->email->UI pipeline
     POST /diagnose/fix  {device}                     auto-fix the fixable linkage gaps
+    GET  /playback?device=<id>&ch=<track>&time=<YYYY-MM-DDTHH:MM:SS>  one recorded still (max-res)
+    GET  /events?device=<id>&ch=<track>&hours=<n>   motion event log (from recordings)
+    GET  /clip?device=<id>&ch=<track>&start=&end=   one motion clip as MP4 (RTSP->ffmpeg)
 """
 
 import http.server
@@ -26,12 +29,34 @@ import socketserver
 import threading
 import urllib.error
 import webbrowser
-from urllib.parse import parse_qs, urlparse
+from datetime import datetime, timedelta
+from urllib.parse import parse_qs, unquote, urlparse
 
-from . import camera, config, diagnose, events, live, motion, store, web
+from . import camera, config, diagnose, events, live, motion, playback, recordings, store, web
 
 _LIVE_FIRST_READ = 512   # bytes to wait for before declaring the stream alive
 _LIVE_CHUNK = 8192
+
+
+def _rtsp_reason(err):
+    """Turn an ffmpeg RTSP stderr blob into a short, actionable message."""
+    e = (err or "").strip()
+    low = e.lower()
+    if "does not contain any stream" in low or "output file is empty" in low:
+        return ("the stream has no video track — this URL serves only audio/metadata "
+                "(the DVR's SDP has no m=video). Check the credentials or use a "
+                "video-capable channel/path.")
+    if "timed out" in low or "timeout" in low:
+        return ("no video from the stream — the RTSP handshake worked but no frames "
+                "arrived. Check the URL path/credentials, or that the camera's media "
+                "port is reachable (RTP not blocked by NAT).")
+    if "401" in e or "unauthorized" in low:
+        return "authentication failed — check the username/password in the URL."
+    if "404" in e or "not found" in low:
+        return "stream path not found — check the URL path (e.g. /Streaming/Channels/101)."
+    if "refused" in low or "unreachable" in low or "no route" in low:
+        return "cannot connect — check the host/port and that it speaks RTSP."
+    return e[:200] or "RTSP unreachable."
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -68,21 +93,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/":
-            self._send(200, web.PAGE, "text/html; charset=utf-8")
+            self._send(200, web.page(), "text/html; charset=utf-8", {"Cache-Control": "no-store"})
             return
         if path == "/app.js":
-            self._send(200, web.APP_JS, "application/javascript; charset=utf-8")
+            self._send(200, web.app_js(), "application/javascript; charset=utf-8", {"Cache-Control": "no-store"})
             return
         if path == "/devices":
             self._json(200, config.list_devices())
+            return
+        if path == "/groups":
+            self._json(200, config.list_groups())
             return
         if path == "/settings":
             self._json(200, config.get_settings())
             return
         if path == "/motion/state":
             device_id = self._query().get("device", "")
-            if not config.get_cfg(device_id):
+            cfg = config.get_cfg(device_id)
+            if not cfg:
                 self._send(404, "unknown device")
+                return
+            if cfg.get("kind") == "rtsp":   # URL-only stream: no ISAPI motion
+                self._json(200, {"ok": False, "supported": False,
+                                 "message": "motion detection needs a DVR", "channels": {}})
                 return
             self._json(200, events.get_state(device_id))
             return
@@ -108,6 +141,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self._handle_live(cfg)
             return
+        if path == "/audio":
+            cfg = self._cfg_from_query()
+            if not cfg:
+                self._send(404, "unknown device")
+                return
+            self._handle_audio(cfg)
+            return
+        if path == "/playback":
+            cfg = self._cfg_from_query()
+            if not cfg:
+                self._send(404, "unknown device")
+                return
+            self._handle_playback(cfg)
+            return
+        if path == "/events":
+            q = self._query()
+            device_id = q.get("device", "")
+            cfg = config.get_cfg(device_id)
+            if not cfg:
+                self._send(404, "unknown device")
+                return
+            hours = int(q.get("hours", "24") or "24")
+            now = datetime.now()  # DVR shares the local wall clock; labeled Z (not real UTC)
+            start = (now - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+            try:
+                # thumbnails are grabbed live from the DVR recording (via /playback);
+                # the event list itself is just times/durations.
+                self._json(200, {"events": recordings.list_events(cfg, q.get("ch", "101"), start, end)})
+            except Exception as e:  # noqa: BLE001
+                self._json(200, {"error": self._explain(e)})
+            return
+        if path == "/clip":
+            cfg = self._cfg_from_query()
+            if not cfg:
+                self._send(404, "unknown device")
+                return
+            self._handle_clip(cfg)
+            return
         if path in ("/channels", "/snapshot", "/motion"):
             cfg = self._cfg_from_query()
             if not cfg:
@@ -128,9 +200,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         first = proc.stdout.read(_LIVE_FIRST_READ)
         if not first:  # ffmpeg produced nothing -> connection/auth/path failure
-            err = (proc.stderr.read() or b"").decode("utf-8", "replace").strip()[:300]
+            err = (proc.stderr.read() or b"").decode("utf-8", "replace")
             live.terminate(proc)
-            self._send(502, "live stream failed: " + (err or "no data (is the RTSP port open?)"))
+            self._send(502, "live stream failed: " + _rtsp_reason(err))
             return
 
         # Drain stderr in the background so its pipe never blocks ffmpeg mid-stream.
@@ -151,7 +223,104 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             live.terminate(proc)
 
+    def _handle_audio(self, cfg):
+        """Stream an RTSP audio track -> MP3 (via ffmpeg) to a browser <audio>, for
+        an audio-only stream (no video). Runs until the browser disconnects."""
+        if not live.ffmpeg_available():
+            self._send(503, "ffmpeg is not installed on the server (e.g. `brew install ffmpeg`)")
+            return
+        q = self._query()
+        proc = live.open_audio(live.rtsp_url(cfg, q.get("ch", "rtsp")))
+        first = proc.stdout.read(_LIVE_FIRST_READ)
+        if not first:  # ffmpeg produced nothing -> connection/auth/no-audio failure
+            err = (proc.stderr.read() or b"").decode("utf-8", "replace")
+            live.terminate(proc)
+            self._send(502, "audio stream failed: " + _rtsp_reason(err))
+            return
+        threading.Thread(target=lambda: proc.stderr.read(), daemon=True).start()
+        self.send_response(200)
+        self.send_header("Content-Type", live.AUDIO_CONTENT_TYPE)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(first)
+            while True:
+                chunk = proc.stdout.read(_LIVE_CHUNK)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # browser closed the Audio window
+        finally:
+            live.terminate(proc)
+
+    def _handle_clip(self, cfg):
+        """Stream one recorded motion clip as MP4 (RTSP playback -> ffmpeg) to a
+        browser <video>, running until the clip ends or the browser disconnects."""
+        if not recordings.ffmpeg_available():
+            self._send(503, "ffmpeg is not installed on the server (e.g. `brew install ffmpeg`)")
+            return
+        q = self._query()
+        # Clip playback gets priority over event-log thumbnail grabs — the DVR only
+        # serves ~one RTSP session, so this pauses grabs for the clip's duration.
+        with playback.rtsp_priority():
+            proc = recordings.clip_process(cfg, q.get("ch", "101"), q.get("start", ""), q.get("end", ""))
+            first = proc.stdout.read(_LIVE_FIRST_READ)
+            if not first:  # ffmpeg produced nothing -> no footage / RTSP unreachable
+                err = (proc.stderr.read() or b"").decode("utf-8", "replace").strip()[:300]
+                recordings.terminate(proc)
+                self._send(502, "clip failed: " + (err or "no recording for that time, or RTSP port unreachable"))
+                return
+            threading.Thread(target=lambda: proc.stderr.read(), daemon=True).start()
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(first)
+                while True:
+                    chunk = proc.stdout.read(_LIVE_CHUNK)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # browser closed the player
+            finally:
+                recordings.terminate(proc)
+
+    def _handle_playback(self, cfg):
+        """Grab one full-res still from the recording at the requested time."""
+        if not live.ffmpeg_available():
+            self._send(503, "ffmpeg is not installed on the server (e.g. `brew install ffmpeg`)")
+            return
+        q = self._query()
+        try:
+            start, end = playback.to_span(q.get("time", ""))
+        except ValueError:
+            self._send(400, "bad time (expected YYYY-MM-DDTHH:MM[:SS])")
+            return
+        url = playback.playback_url(cfg, q.get("ch", "101"), start, end)
+        width = None
+        if q.get("res"):  # e.g. "480x270" -> scale thumbnails down
+            try:
+                width = int(q["res"].lower().split("x")[0])
+            except (ValueError, IndexError):
+                pass
+        data, err = playback.grab_frame(url, width=width)
+        if not data.startswith(b"\xff\xd8"):  # not a JPEG -> playback failed
+            msg = err.strip()[:250] or "no recording at that time, or RTSP port unreachable"
+            self._send(502, "playback failed: " + msg)
+            return
+        # a recorded frame at a fixed past instant never changes -> let the browser
+        # cache it so clicking the thumbnail (same URL) is instant and never re-grabs.
+        self._send(200, data, "image/jpeg", {"Cache-Control": "max-age=86400, immutable"})
+
     def _handle_camera_get(self, path, cfg):
+        # A URL-only RTSP device has no ISAPI: one synthetic channel, and its still
+        # is a single frame grabbed from the stream via ffmpeg (not an ISAPI picture).
+        if cfg.get("kind") == "rtsp":
+            self._handle_rtsp_get(path, cfg)
+            return
         try:
             if path == "/channels":
                 self._json(200, camera.discover_channels(cfg))
@@ -164,6 +333,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001 - surface any camera failure to the UI
             self._send(502, self._explain(e))
 
+    def _handle_rtsp_get(self, path, cfg):
+        """/channels + /snapshot for a URL-only RTSP device (no ISAPI)."""
+        if path == "/channels":
+            name = cfg.get("name") or (cfg.get("path") or "").lstrip("/") or "RTSP stream"
+            self._json(200, [{"id": "rtsp", "input": "1", "name": name}])
+            return
+        if path == "/motion":
+            self._send(400, "motion detection is not available for an RTSP-only stream")
+            return
+        if not live.ffmpeg_available():
+            self._send(503, "ffmpeg is not installed on the server (e.g. `brew install ffmpeg`)")
+            return
+        q = self._query()
+        width = None
+        if q.get("res"):
+            try:
+                width = int(q["res"].lower().split("x")[0])
+            except (ValueError, IndexError):
+                pass
+        data, err = live.grab_still(live.rtsp_url(cfg, "rtsp"), width=width)
+        if not data.startswith(b"\xff\xd8"):
+            if live.no_video(err):   # audio/metadata-only stream -> tell the UI to switch to audio mode
+                self._send(200, json.dumps({"audio_only": True}),
+                           "application/json", {"Cache-Control": "no-store"})
+                return
+            self._send(502, "stream grab failed: " + _rtsp_reason(err))
+            return
+        self._send(200, data, "image/jpeg", {"Cache-Control": "no-store"})
+
     # --- POST --------------------------------------------------------------
     def do_POST(self):
         path = urlparse(self.path).path
@@ -173,12 +371,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 self._send(400, "bad json")
                 return
-            if not p.get("host") or not p.get("port"):
-                self._send(400, "host and port are required")
+            if not p.get("rtsp_url") and (not p.get("host") or not p.get("port")):
+                self._send(400, "host and port are required (or an rtsp_url)")
                 return
             masked = config.add_device(p)
-            events.ensure(masked["id"])  # start watching the new device for motion
+            if masked.get("kind") != "rtsp":       # RTSP-only streams have no ISAPI alert stream
+                events.ensure(masked["id"])         # start watching the new DVR for motion
             self._json(200, masked)
+            return
+        if path == "/groups":
+            try:
+                p = self._read_json()
+            except json.JSONDecodeError:
+                self._send(400, "bad json")
+                return
+            if not str(p.get("name") or "").strip():
+                self._send(400, "group name is required")
+                return
+            self._json(200, config.create_group(p["name"]))
             return
         if path == "/save":
             try:
@@ -186,13 +396,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 self._json(200, {"ok": False, "message": "bad json"})
                 return
-            cfg = config.get_cfg(str(p.get("device", "")))
+            device_id = str(p.get("device", ""))
+            cfg = config.get_cfg(device_id)
             if not cfg:
                 self._json(200, {"ok": False, "message": "unknown device"})
                 return
+            ch = str(p.get("ch", "101"))
+            label = config.device_label(device_id)
             try:
-                saved = store.save_snapshot(cfg, str(p.get("ch", "101")),
-                                            label=config.device_label(str(p.get("device", ""))))
+                if cfg.get("kind") == "rtsp":       # grab a frame from the stream via ffmpeg
+                    data, err = live.grab_still(live.rtsp_url(cfg, ch), width=1280)
+                    if not data.startswith(b"\xff\xd8"):
+                        raise RuntimeError(_rtsp_reason(err))
+                    saved = store.save_bytes(data, ch, label=label)
+                else:
+                    saved = store.save_snapshot(cfg, ch, label=label)
                 self._json(200, {"ok": True, "path": saved})
             except Exception as e:  # noqa: BLE001
                 self._json(200, {"ok": False, "message": self._explain(e)})
@@ -281,6 +499,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             config.delete_device(parts[1])
             events.stop(parts[1])  # retire its motion monitor
             self._json(200, {"ok": True})
+            return
+        if len(parts) == 2 and parts[0] == "groups":
+            # ?devices=1 -> also delete every member device (cascade); else un-assign.
+            cascade = self._query().get("devices") in ("1", "true", "yes")
+            deleted = config.delete_group(unquote(parts[1]), delete_devices=cascade)
+            for dev_id in deleted:
+                events.stop(dev_id)  # retire each deleted device's motion monitor
+            self._json(200, {"ok": True, "deleted": deleted})
             return
         self._send(404, "not found")
 

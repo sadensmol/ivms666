@@ -48,6 +48,7 @@ class StoreTest(unittest.TestCase):
         self.assertTrue(name.endswith("_motion.jpg"))
         self.assertIn("_201_", name)
 
+
     def test_malicious_channel_id_stays_inside_folder(self):
         # a browser-supplied ch must not escape the save folder via path separators
         path = store.save_snapshot(self._cfg(), "../../etc/evil", label="cam")

@@ -57,6 +57,20 @@ def open_stream(cfg, path, timeout=60):
     return _opener(cfg, url).open(req, timeout=timeout)
 
 
+def camera_post(cfg, path, body, timeout=30):
+    """POST xml to a path on the camera (e.g. ContentMgmt/search). Returns
+    (content_type, bytes)."""
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"http://{cfg['host']}:{cfg['port']}{path}"
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"User-Agent": "camera-viewer", "Content-Type": "application/xml"},
+    )
+    with _opener(cfg, url).open(req, timeout=timeout) as resp:
+        return resp.headers.get("Content-Type", ""), resp.read()
+
+
 def fetch_snapshot(cfg, channel_id, resolution=None):
     """Fetch a JPEG still. `resolution` like '1280x720' asks the DVR for a
     higher-quality frame (the endpoint defaults to a low D1 image); if the

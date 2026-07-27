@@ -9,10 +9,23 @@ Hikvision-style DVR/NVRs. Runs a small local web server and opens your browser.
 python3 camera_viewer.py
 ```
 
-Then in the browser: **+ Add camera** → enter host/port/username/password.
+Then in the browser, add a device two ways (both use the same fields —
+host, ISAPI port + an **ISAPI enabled** checkbox, RTSP port, agentgreen port,
+username, password):
+- **+ Add DVR** → for a Hikvision-style ISAPI DVR (snapshots, motion, recording,
+  event log, diagnose).
+- **+ Add RTSP stream** → paste a **full RTSP URL** (`rtsp://user:pass@host:554/path`);
+  it's split into the fields above (all editable afterwards in the standard Edit
+  dialog). The URL's path (e.g. `/Streaming/Channels/101`) is the camera. RTSP-only
+  devices do Live + snapshots via ffmpeg; motion/recording/event-log need ISAPI.
+
+Turn the **ISAPI enabled** checkbox off on any device to work over RTSP only.
+Group devices together with **+ Create group**.
+
 Credentials and your view setup are saved to `~/.camera_viewer.json` (chmod 600)
 and restored on the next launch. Passwords stay on the server — the browser
-never receives them.
+never receives them (a pasted RTSP URL's credentials are parsed into the
+password field, never sent back to the browser).
 
 List cameras from the terminal instead:
 
@@ -46,10 +59,16 @@ a **JSON list** (scanned together, hosts de-duplicated) or a single/comma string
 `--range` (one spec or comma-separated) and `--ports` override the config lists.
 Only scan IPs/ranges you own.
 
-Hosts are probed **in parallel** — up to `--parallel` at a time (default 10,
-capped at the number of IPs). Within each host, login/password combinations are
-still tried **one at a time** (concurrent auth can trip a DVR lockout), so
-progress is shown per host (`scanning N of M hosts`).
+The scan is **pipelined with live output**: a pool of `--parallel` workers
+(default 10) hunts for RTSP across the range, and the moment a worker finds a
+port it **verifies that port's login/password right there** while the other
+workers keep scanning. The terminal shows a live view: each `✓ RTSP host:port`
+stays as a permanent line, and directly below the hosts still being checked a
+line updates in place — `host:port  trying user:pass (i/n)` — with a
+`N/M hosts · X RTSP · Y verified` line at the bottom; a solved port prints a
+permanent `→ login OK …`. Credentials are still tried **one at a time within a
+host** (concurrent auth can trip a DVR lockout). Piped output stays plain; Ctrl+C
+stops it cleanly.
 
 ### Verifying credentials and setting up the app
 
@@ -104,10 +123,22 @@ are included.
 > ⚠️ Size grows fast: `/24` = 256 addresses, `/16` = 65 536, `/8` = ~16 million.
 > Scan the smallest range that covers your cameras.
 
+### Known ranges
+
+| Range | Owner |
+|---|---|
+| `85.172.0.0 – 85.175.255.255` | Rostelecom |
+
+> Only scan IPs/ranges you own or are authorized to test.
+
 ## Features
 
 - **Multiple cameras/NVRs**, each with saved credentials.
 - **Auto channel discovery** and a live snapshot gallery (one image per camera).
+- **Pause/activate cameras** — a checkbox per tile (and a group checkbox per device)
+  turns a camera **inactive**: it stops refreshing and shows no frame, so you don't
+  spend DVR/RTSP bandwidth on cameras you're not watching. Pause every camera in a
+  device and it collapses to just its header. Remembered across restarts.
 - **Quality** selector — HD 720p or SD (the DVR defaults stills to low-res).
 - **Live** view — real-time video. The server transcodes the DVR's RTSP H.264 to
   a browser-playable MJPEG stream with **ffmpeg** (only external dependency, used
@@ -120,15 +151,27 @@ are included.
   The server subscribes to the DVR's event alert stream (no polling of the video),
   so it works even with the browser closed. (Requires the camera's motion trigger to
   have "Notify Surveillance Center" enabled — use **Diagnose** below to check/fix it.)
-- **Diagnose** — a per-device button (device header) audits each visible camera's
+- **Diagnose** — a per-device button (device header) audits each camera's
   motion→email→app pipeline: motion enabled + area painted, the VMD trigger's
-  `email` and `center` linkages, and SMTP. It flags problems and offers one-click
-  **Fix** for the repairable ones (adds the missing `email`/`center` linkage). Hidden
-  cameras are skipped.
+  `email` and `center` linkages, SMTP, **recording** (motion-triggered with
+  10s pre/post-record), **recording quality** (main stream ≥HD, raised to the
+  highest resolution the DVR truly accepts), and the **DVR clock** (fixes a wrong
+  clock so recording/e-mail timestamps are right). Cameras you've **hidden**, and
+  inputs with **no camera** (empty NO-VIDEO slots), skip the full check — instead
+  it flags any recording still left ON for them and offers to **turn it off to save
+  disk space**. One-click **Fix** repairs all the fixable ones.
 - **Save images to a folder** — the **Save** button (and every motion event) writes
   a **max-resolution (720p)** JPEG to a folder you choose in **⚙ Settings**
   (default `~/CameraViewer`, created if missing). Saving happens on the server, so
   the file lands on the machine running Camera Viewer.
+- **Event log** — per-camera ⚙ → "Event log": lists the DVR's **motion events**
+  (each a motion-triggered recording with 10s before/after), newest first, with
+  time and duration. Each row shows **thumbnail frames** of that event (a small
+  timeline across the ±10s window — click one to enlarge). **▶ Play** streams the
+  clip into a video player with native play/pause/seek/rewind and a speed selector.
+  Needs the DVR set to motion recording (use **Diagnose** to enable it) and ffmpeg
+  + the forwarded RTSP port for Play. If the list is empty, recording isn't
+  motion-triggered yet.
 - **Reboot** — a per-device button (in the device header, next to Edit/Delete)
   reboots the whole DVR/NVR (`ISAPI /System/reboot`) after a confirm; all its
   cameras drop for ~a minute and the app reconnects on its own.

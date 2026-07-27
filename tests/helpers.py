@@ -33,11 +33,17 @@ OK_RESP = (
 FAKE_JPEG = b"\xff\xd8" + b"fake-jpeg-body" + b"\xff\xd9"
 
 
-def video_inputs_xml(count=2):
+def video_inputs_xml(count=2, disabled=()):
+    """Video-input list. Ids in `disabled` are rendered as an empty slot with no
+    camera (videoInputEnabled=false / resDesc=NO VIDEO)."""
     ns = 'xmlns="http://www.hikvision.com/ver20/XMLSchema"'
+    off = {str(x) for x in disabled}
     rows = "".join(
         f"<VideoInputChannel><id>{i}</id><name>Camera {i:02d}</name>"
-        f"<inputPort>{i}</inputPort></VideoInputChannel>"
+        f"<inputPort>{i}</inputPort>"
+        f"<videoInputEnabled>{'false' if str(i) in off else 'true'}</videoInputEnabled>"
+        f"<resDesc>{'NO VIDEO' if str(i) in off else '1080P30'}</resDesc>"
+        f"</VideoInputChannel>"
         for i in range(1, count + 1)
     )
     return f'<VideoInputChannelList {ns}>{rows}</VideoInputChannelList>'.encode()
@@ -87,6 +93,75 @@ def motion_xml(gridmap, sensitivity=60, enabled="true", cols=22, rows=18):
     ).encode()
 
 
+def record_track_xml(mode="CMR", pre=5, post=5, actions=2, enable=True):
+    """A recording-track payload shaped like the DVR's, for diagnose tests."""
+    acts = "".join(
+        f"<ScheduleAction><id>{i}</id><Actions><Record>true</Record>"
+        f"<ActionRecordingMode>{mode}</ActionRecordingMode></Actions></ScheduleAction>"
+        for i in range(1, actions + 1)
+    )
+    return (
+        '<Track version="1.0" xmlns="http://www.std-cgi.com/ver20/XMLSchema"><id>101</id>'
+        f"<Enable>{'true' if enable else 'false'}</Enable>"
+        f"<DefaultRecordingMode>{mode}</DefaultRecordingMode>"
+        f"<TrackSchedule><ScheduleBlockList><ScheduleBlock>{acts}</ScheduleBlock>"
+        "</ScheduleBlockList></TrackSchedule>"
+        "<CustomExtensionList><CustomExtension>"
+        f"<PreRecordTimeSeconds>{pre}</PreRecordTimeSeconds>"
+        f"<PostRecordTimeSeconds>{post}</PostRecordTimeSeconds>"
+        "</CustomExtension></CustomExtensionList></Track>"
+    ).encode()
+
+
+def stream_channel_xml(width=1920, height=1080):
+    """A main-stream StreamingChannel with a resolution, for quality checks."""
+    return (
+        '<StreamingChannel xmlns="http://www.hikvision.com/ver20/XMLSchema"><id>101</id>'
+        f"<Video><videoResolutionWidth>{width}</videoResolutionWidth>"
+        f"<videoResolutionHeight>{height}</videoResolutionHeight></Video></StreamingChannel>"
+    ).encode()
+
+
+def stream_caps_xml(max_w=1920, max_h=1080):
+    """Streaming capabilities advertising the resolution options (opt lists)."""
+    return (
+        '<StreamingChannel xmlns="http://www.hikvision.com/ver20/XMLSchema"><Video>'
+        f'<videoResolutionWidth opt="{max_w},1280,704">1920</videoResolutionWidth>'
+        f'<videoResolutionHeight opt="{max_h},720,576">1080</videoResolutionHeight>'
+        "</Video></StreamingChannel>"
+    ).encode()
+
+
+def time_xml(skew_secs=0, tz="+03:00"):
+    """A /ISAPI/System/time payload whose localTime is `skew_secs` away from real
+    local time in `tz` (0 = correct). Uses live now() so diagnose's clock check
+    sees an actual diff."""
+    import datetime as _dt
+    sign = 1 if tz[0] == "+" else -1
+    hh, mm = tz[1:].split(":")
+    off = sign * (int(hh) * 3600 + int(mm) * 60)
+    local = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=off + skew_secs)
+    stamp = local.strftime("%Y-%m-%dT%H:%M:%S") + tz
+    return (f'<Time version="2.0"><timeMode>manual</timeMode>'
+            f"<localTime>{stamp}</localTime><timeZone>CST-3:00:00</timeZone></Time>").encode()
+
+
+def cmsearch_result_xml(spans):
+    """A CMSearchResult with one motion match per (start_iso, end_iso) span."""
+    items = "".join(
+        f"<searchMatchItem><trackID>101</trackID>"
+        f"<timeSpan><startTime>{s}</startTime><endTime>{e}</endTime></timeSpan>"
+        f"<mediaSegmentDescriptor><playbackURI>rtsp://x/Streaming/tracks/101/?starttime={s}"
+        f"</playbackURI></mediaSegmentDescriptor><metadataMatches>"
+        f"<metadataDescriptor>recordType.meta.std-cgi.com/motion</metadataDescriptor>"
+        f"</metadataMatches></searchMatchItem>"
+        for s, e in spans
+    )
+    return (f'<CMSearchResult><searchID>x</searchID><responseStatus>true</responseStatus>'
+            f"<numOfMatches>{len(spans)}</numOfMatches><matchList>{items}</matchList>"
+            f"</CMSearchResult>").encode()
+
+
 class FakeCamera:
     """Records requests and dispatches to a caller-provided handler.
 
@@ -98,6 +173,7 @@ class FakeCamera:
         self.handler = handler
         self.gets = []
         self.puts = []
+        self.posts = []
         self._orig = None
 
     def _get(self, cfg, path, timeout=15):
@@ -108,11 +184,15 @@ class FakeCamera:
         self.puts.append((path, body))
         return self.handler("PUT", path, body)
 
+    def _post(self, cfg, path, body, timeout=30):
+        self.posts.append((path, body))
+        return self.handler("POST", path, body)
+
     def __enter__(self):
-        self._orig = (camera.camera_get, camera.camera_put)
-        camera.camera_get, camera.camera_put = self._get, self._put
+        self._orig = (camera.camera_get, camera.camera_put, camera.camera_post)
+        camera.camera_get, camera.camera_put, camera.camera_post = self._get, self._put, self._post
         return self
 
     def __exit__(self, *exc):
-        camera.camera_get, camera.camera_put = self._orig
+        camera.camera_get, camera.camera_put, camera.camera_post = self._orig
         return False

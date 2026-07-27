@@ -14,8 +14,9 @@
   h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .3px; }
   .grow { flex: 1; }
   header .ctl { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #9aa3af; }
-  input { background: #0e1116; border: 1px solid #2a2f3a; color: #e6e8eb;
+  input, textarea { background: #0e1116; border: 1px solid #2a2f3a; color: #e6e8eb;
           padding: 7px 9px; border-radius: 6px; font-size: 13px; width: 100%; }
+  textarea { resize: vertical; font-family: inherit; line-height: 1.4; }
   input.small { width: 78px; }
   select { background: #0e1116; border: 1px solid #2a2f3a; color: #e6e8eb;
            padding: 6px 8px; border-radius: 6px; font-size: 13px; }
@@ -26,6 +27,19 @@
   .toggle { display: flex; align-items: center; gap: 6px; font-size: 13px; }
   .toggle input { width: auto; }
 
+  /* group: a named container nesting member device sections */
+  .groupwrap { border-bottom: 2px solid #2a2f3a; }
+  .ghead { display: flex; align-items: center; gap: 10px; padding: 10px 16px;
+           background: #10141b; border-bottom: 1px solid #20242e;
+           position: sticky; top: 53px; z-index: 11; }
+  .ghead .gname { font-size: 14px; font-weight: 700; letter-spacing: .3px; }
+  .ghead .gcount { color: #9aa3af; font-size: 12px; }
+  .ghead .gtoggle { display: inline-flex; align-items: center; cursor: pointer; }
+  .ghead .gtoggle input { width: auto; margin: 0; accent-color: #2ea043; }
+  .gmembers .device .dhead { top: 92px; }   /* nested headers sit below the group header */
+  .gempty { padding: 16px; color: #9aa3af; font-size: 13px; }
+  .streamgrid { padding-top: 14px; }         /* a group's RTSP streams = a line of camera tiles */
+
   .device { border-bottom: 1px solid #20242e; }
   .dhead { display: flex; align-items: center; gap: 10px; padding: 12px 16px;
            background: #161a21; position: sticky; top: 53px; z-index: 10; }
@@ -33,15 +47,35 @@
   .dhead small { color: #9aa3af; }
   .dhead .dot { width: 8px; height: 8px; border-radius: 50%; background: #6b7280; }
   .dhead .dot.ok { background: #2ea043; } .dhead .dot.err { background: #d9534f; }
+  .devtoggle { display: inline-flex; align-items: center; cursor: pointer; }
+  .devtoggle input { width: auto; margin: 0; accent-color: #2ea043; }
+  .grid.collapsed { display: none; }  /* all cameras paused -> header only */
+  .gmembers.collapsed { display: none; }  /* group turned off -> fold to its header */
   .grid { display: grid; gap: 14px; padding: 16px;
           grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
   .tile { background: #0e1116; border: 1px solid #2a2f3a; border-radius: 10px;
           overflow: hidden; display: flex; flex-direction: column; }
   .tile .bar { display: flex; align-items: center; gap: 8px; padding: 8px 10px;
                background: #161a21; border-bottom: 1px solid #2a2f3a; }
-  .tile .bar b { font-size: 13px; } .tile .bar small { color: #9aa3af; }
-  .tile .bar .grow { flex: 1; }
+  /* name truncates with an ellipsis so a long RTSP path never pushes the
+     Live/Save/⚙ buttons off the tile (they're overflow:hidden clipped). */
+  .tile .bar b { font-size: 13px; flex: 0 1 auto; min-width: 0;
+                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tile .bar small { color: #9aa3af; flex-shrink: 0; }
+  .tile .bar .grow { flex: 1 1 0; }
+  .tile .bar .iconbtn, .tile .bar .tilemenu { flex-shrink: 0; }
+  .tile .bar .actck { display: inline-flex; align-items: center; cursor: pointer; }
+  .tile .bar .actck input { width: auto; margin: 0; accent-color: #2ea043; }
   .tile img { width: 100%; aspect-ratio: 16/9; object-fit: contain; background: #0a0c0f; display: block; }
+  .tile.paused img { display: none; }   /* paused -> no frame shown */
+  /* audio-only stream (no video track): a placeholder instead of the <img> frame */
+  .tile .audioph { display: flex; flex-direction: column; align-items: center; justify-content: center;
+                   aspect-ratio: 16/9; background: #0a0c0f; color: #9aa3af; gap: 4px; font-size: 15px; }
+  .tile .audioph small { color: #6b7280; text-transform: none; font-size: 12px; }
+  #liveAudio { display: none; }
+  .overlay.live.audio #liveImg { display: none; }
+  .overlay.live.audio #liveAudio { display: block; width: 80%; margin: 48px auto; }
+  .tile.paused { opacity: .6; }
   .tile .msg { padding: 8px 10px; font-size: 12px; color: #9aa3af; min-height: 30px; }
   .tile .msg.err { color: #ff8080; }
   .iconbtn { background: #2a2f3a; padding: 5px 10px; font-size: 12px; }
@@ -74,6 +108,19 @@
   .chk .ico { width: 14px; } .chk.ok .ico { color: #2ea043; } .chk.bad .ico { color: #ff6b6b; }
   .chk.bad { color: #ffb3b3; }
   .diagsum { font-size: 13px; margin-bottom: 12px; }
+
+  /* event log rows */
+  .evrow { display: flex; align-items: center; gap: 12px; padding: 10px 2px;
+           border-bottom: 1px solid #20242e; font-size: 13px; }
+  .evmeta { display: flex; flex-direction: column; min-width: 116px; }
+  .evtime { font-variant-numeric: tabular-nums; }
+  .evdur { color: #9aa3af; font-size: 12px; }
+  .evthumbs { display: flex; gap: 6px; flex-wrap: wrap; flex: 1; }
+  .evthumb { height: 60px; width: 106px; border-radius: 4px; cursor: pointer; border: 1px solid #2a2f3a;
+             background: #0a0c0f; object-fit: cover; }
+  .evthumb:hover { border-color: #2f6feb; }
+  .evthumb.evfail { cursor: default; }  /* grab failed (DVR playback unreachable) — dark box */
+  .evnone { color: #9aa3af; font-size: 12px; align-self: center; }
   .empty { padding: 40px 16px; text-align: center; color: #9aa3af; }
   .status { padding: 8px 16px; font-size: 12px; color: #9aa3af;
             border-top: 1px solid #2a2f3a; background: #161a21; position: sticky; bottom: 0; }
@@ -106,15 +153,17 @@
   .lpill { font-size: 12px; color: #7ee787; background: #14261a; border: 1px solid #204a2c;
            padding: 3px 8px; border-radius: 999px; }
   /* motion popup: a big, unmissable alert even before the image loads */
-  #motOverlay .modal { max-width: 96vw; border: 2px solid #d9534f; box-shadow: 0 0 0 4px rgba(217,83,79,.25); }
-  #motOverlay .live-stage { min-height: 60vh; min-width: 72vw; }
-  #motOverlay .lpill { color: #ff9a9a; background: #2a1518; border-color: #4a2029; }
+  #imgOverlay .modal { max-width: 96vw; }
+  #imgOverlay .live-stage { min-height: 50vh; min-width: 60vw; }
+  #imgOverlay.motion .modal { border: 2px solid #d9534f; box-shadow: 0 0 0 4px rgba(217,83,79,.25); }
 </style>
 </head>
 <body>
 <header>
   <h1>📷 Camera Viewer</h1>
-  <button id="addBtn">+ Add camera</button>
+  <button id="addBtn">+ Add DVR</button>
+  <button id="addRtspBtn" class="secondary">+ Add RTSP stream</button>
+  <button id="addGroupBtn" class="secondary">+ Create group</button>
   <button id="settingsBtn" class="secondary">⚙ Settings</button>
   <span class="grow"></span>
   <span class="ctl">Quality
@@ -137,12 +186,31 @@
     <div class="mhead"><h2 id="devTitle">Add camera</h2><span class="grow"></span>
       <button class="secondary" id="devClose">Close</button></div>
     <div class="form">
-      <label>Name <input id="dName" placeholder="e.g. Front NVR"></label>
-      <label>Host / IP <input id="dHost" placeholder="e.g. 192.168.1.64"></label>
-      <label>Port <input id="dPort" value="80" placeholder="80"></label>
-      <label>Username <input id="dUser" autocomplete="off"></label>
-      <label>Password <input id="dPass" type="password" autocomplete="off" placeholder=""></label>
-      <label>RTSP port <input id="dRtsp" value="554" placeholder="554"> <small style="text-transform:none;color:#9aa3af">for Live video — forward this on the router</small></label>
+      <label id="devNameField">Name <input id="dName" placeholder="e.g. Front NVR"></label>
+      <label>Group <input id="dGroup" list="groupDatalist" placeholder="none — pick or type a group">
+        <small style="text-transform:none;color:#9aa3af">Optional. Devices sharing a group show together under one header. Leave blank for none.</small></label>
+      <datalist id="groupDatalist"></datalist>
+      <div id="devUrlField">
+        <label style="margin-bottom:4px">RTSP URLs
+          <textarea id="dUrls" rows="3" autocomplete="off" spellcheck="false"
+                    placeholder="rtsp://user:pass@host:554/path&#10;one per line (or comma/space separated)"></textarea></label>
+        <small style="text-transform:none;color:#9aa3af">Paste one or more RTSP URLs separated by new lines, commas or spaces. Each becomes a stream; the name is taken from the URL.</small></div>
+      <div id="devFields">
+        <label>Host / IP <input id="dHost" placeholder="e.g. 192.168.1.64"></label>
+        <label>ISAPI port <span style="text-transform:none;font-weight:400">
+          <input id="dPort" value="80" placeholder="80" style="width:80px">
+          <label class="inlinechk" style="display:inline-flex;align-items:center;gap:5px;text-transform:none"><input type="checkbox" id="dIsapi" checked style="width:auto"> enabled</label></span>
+          <small style="text-transform:none;color:#9aa3af">Uncheck to work over RTSP only (no snapshots-via-ISAPI, motion, diagnose, event log).</small></label>
+        <label>agentgreen port <span style="text-transform:none;font-weight:400">
+          <input id="dAgent" value="8090" placeholder="8090" style="width:80px">
+          <label class="inlinechk" style="display:inline-flex;align-items:center;gap:5px;text-transform:none"><input type="checkbox" id="dAgentEnabled" style="width:auto"> enabled</label></span>
+          <small style="text-transform:none;color:#9aa3af">Off by default — not everyone uses agentgreen.</small></label>
+        <label>RTSP port <input id="dRtsp" value="554" placeholder="554"> <small style="text-transform:none;color:#9aa3af">for Live video — forward this on the router</small></label>
+        <label>Username <input id="dUser" autocomplete="off"></label>
+        <label>Password <input id="dPass" type="password" autocomplete="off" placeholder=""></label>
+        <label id="devPathField">RTSP path <input id="dPath" placeholder="/Streaming/Channels/101">
+          <small style="text-transform:none;color:#9aa3af">The camera path used in the RTSP URL (RTSP-only devices).</small></label>
+      </div>
       <div class="mfoot" style="padding:4px 0;border:0">
         <span class="mmsg" id="devMsg"></span><span class="grow"></span>
         <button id="devSave">Save</button>
@@ -158,9 +226,15 @@
       <button class="secondary" id="setClose">Close</button></div>
     <div class="form">
       <label>Save images to <input id="setPath" placeholder="~/CameraViewer"></label>
-      <small style="text-transform:none;color:#9aa3af">Folder on this computer where motion
-        auto-snapshots and manual <b>Save</b> land (created if missing). Images are stored at
-        max resolution (720p — this DVR's largest still).</small>
+      <small style="text-transform:none;color:#9aa3af">Folder on this computer where a manual
+        <b>Save</b> lands (created if missing). Images are stored at max resolution
+        (720p — this DVR's largest still).</small>
+      <label class="chkline" style="flex-direction:row;align-items:center;gap:8px;text-transform:none">
+        <input type="checkbox" id="setMotionPopup" style="width:auto">
+        Show full-screen popup when motion is detected</label>
+      <small style="text-transform:none;color:#9aa3af">Off by default — the tile just blinks a red
+        border. When on, a live full-screen still also pops up while a camera is in motion. Saved
+        as soon as you toggle it.</small>
       <div class="mfoot" style="padding:4px 0;border:0">
         <span class="mmsg" id="setMsg"></span><span class="grow"></span>
         <button id="setSave">Save</button>
@@ -174,12 +248,49 @@
   <div class="modal live">
     <div class="mhead"><h2 id="liveTitle">Live</h2>
       <span class="lpill" id="liveFps">—</span>
-      <small style="color:#9aa3af">main stream · HD</small>
+      <small id="liveStreamMeta" style="color:#9aa3af">main stream · HD</small>
       <span class="grow"></span>
       <button id="liveSave">Save frame</button>
       <button class="secondary" id="liveClose">Close</button></div>
-    <div class="live-stage"><img id="liveImg" alt=""></div>
+    <div class="live-stage"><img id="liveImg" alt=""><audio id="liveAudio" controls></audio></div>
     <div class="hint" id="liveMsg" style="padding:8px 16px"></div>
+  </div>
+</div>
+
+<!-- Event log: motion clips from the DVR's recordings -->
+<div class="overlay" id="evOverlay">
+  <div class="modal">
+    <div class="mhead"><h2 id="evTitle">Event log</h2>
+      <span class="ctl" style="margin-left:12px">last
+        <select id="evHours"><option value="6">6h</option><option value="24" selected>24h</option>
+          <option value="72">3d</option><option value="168">7d</option></select></span>
+      <span class="grow"></span>
+      <button class="secondary" id="evClose">Close</button></div>
+    <div class="hint">Each row is a motion-triggered recording (10s before + after the motion).
+      Needs the DVR set to motion recording — run <b>Diagnose</b> if the list is empty.</div>
+    <div id="evBody" style="padding:8px 16px; max-height:66vh; overflow:auto"></div>
+  </div>
+</div>
+
+<!-- Single image popup: the motion-detected snapshot AND the event-frame lightbox -->
+<div class="overlay live" id="imgOverlay">
+  <div class="modal live">
+    <div class="mhead"><h2 id="imgTitle">Image</h2><span class="grow"></span>
+      <button class="secondary" id="imgClose">Close</button></div>
+    <div class="live-stage"><img id="imgBig" alt=""></div>
+  </div>
+</div>
+
+<!-- Video player for a motion clip (native controls: play/pause/seek/rewind + speed) -->
+<div class="overlay live" id="vidOverlay">
+  <div class="modal live">
+    <div class="mhead"><h2 id="vidTitle">Playback</h2>
+      <span class="ctl" style="margin-left:12px">speed
+        <select id="vidSpeed"><option>0.5</option><option selected>1</option><option>2</option><option>4</option></select></span>
+      <span class="grow"></span>
+      <span class="mmsg" id="vidMsg"></span>
+      <button class="secondary" id="vidClose">Close</button></div>
+    <div class="live-stage"><video id="vidPlayer" controls style="max-width:96vw;max-height:82vh"></video></div>
   </div>
 </div>
 
@@ -190,18 +301,6 @@
       <button id="diagFix" style="display:none">Fix issues</button>
       <button class="secondary" id="diagClose">Close</button></div>
     <div id="diagBody" style="padding:16px; max-height:70vh; overflow:auto"></div>
-  </div>
-</div>
-
-<!-- Motion-detected popup (full-screen captured frame) -->
-<div class="overlay live" id="motOverlay">
-  <div class="modal live">
-    <div class="mhead">
-      <span class="lpill" style="color:#ff9a9a;background:#2a1518;border-color:#4a2029">● MOTION</span>
-      <h2 id="motTitle">Motion detected</h2>
-      <span class="grow"></span>
-      <button class="secondary" id="motClose">Close</button></div>
-    <div class="live-stage"><img id="motImg" alt=""></div>
   </div>
 </div>
 

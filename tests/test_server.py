@@ -8,9 +8,11 @@ import unittest
 import urllib.error
 import urllib.request
 
-from cameraviewer import camera, config, events, live, server
+from cameraviewer import camera, config, events, live, playback, recordings, server
 from tests.helpers import (
-    FakeCamera, FakeProc, FAKE_JPEG, OK_RESP, all_on_gridmap, motion_xml, video_inputs_xml)
+    FakeCamera, FakeProc, FAKE_JPEG, OK_RESP, all_on_gridmap, cmsearch_result_xml,
+    motion_xml, record_track_xml, stream_caps_xml, stream_channel_xml, time_xml,
+    video_inputs_xml)
 
 
 def _raise_404(path):
@@ -28,6 +30,8 @@ def camera_handler(method, path, body):
         return ("application/xml", OK_RESP)
     if path == "/ISAPI/System/reboot":
         return ("application/xml", OK_RESP)
+    if path == "/ISAPI/System/time":
+        return ("application/xml", OK_RESP if method == "PUT" else time_xml(0))  # clock in sync
     if path.startswith("/ISAPI/Event/triggers/VMD-"):
         if method == "PUT":
             return ("application/xml", OK_RESP)
@@ -42,6 +46,19 @@ def camera_handler(method, path, body):
                 b"<mailing><hostName>smtp.x.com</hostName><receiverList>"
                 b"<receiver><receiverAddress>a@x.com</receiverAddress></receiver>"
                 b"</receiverList></mailing>")
+    if path.startswith("/ISAPI/ContentMgmt/record/tracks/"):
+        if method == "PUT":
+            return ("application/xml", OK_RESP)
+        return ("application/xml", record_track_xml())  # CMR/5/5 -> diagnose flags it
+    if path.startswith("/ISAPI/Streaming/channels/"):
+        if path.endswith("/capabilities"):
+            return ("application/xml", stream_caps_xml())
+        if method == "PUT":
+            return ("application/xml", OK_RESP)
+        return ("application/xml", stream_channel_xml())  # 1920x1080 -> quality OK
+    if path == "/ISAPI/ContentMgmt/search":
+        return ("application/xml",
+                cmsearch_result_xml([("2026-07-26T08:01:34Z", "2026-07-26T08:01:51Z")]))
     raise AssertionError("unexpected camera path: " + path)
 
 
@@ -113,6 +130,79 @@ class ServerTest(unittest.TestCase):
         st, _ = self.req("POST", "/devices", {"name": "x"})
         self.assertEqual(st, 400)
 
+    # --- URL-only RTSP stream devices --------------------------------------
+    def add_rtsp(self):
+        st, b = self.req("POST", "/devices",
+                         {"name": "Yard", "rtsp_url": "rtsp://u:sesame@cam:8554/live"})
+        return st, json.loads(b)
+
+    def test_add_rtsp_device_masks_url_and_sets_kind(self):
+        st, dev = self.add_rtsp()
+        self.assertEqual(st, 200)
+        self.assertEqual(dev["kind"], "rtsp")
+        self.assertNotIn("sesame", json.dumps(dev))            # password in URL never returned
+        _, listed = self.req("GET", "/devices")
+        self.assertNotIn(b"sesame", listed)
+
+    def test_rtsp_channels_are_a_single_synthetic_channel(self):
+        _, dev = self.add_rtsp()
+        st, b = self.req("GET", "/channels?device=" + dev["id"])
+        self.assertEqual(st, 200)
+        chans = json.loads(b)
+        self.assertEqual([c["id"] for c in chans], ["rtsp"])
+
+    def test_rtsp_snapshot_grabs_a_frame_from_the_stream(self):
+        _, dev = self.add_rtsp()
+        orig_a, orig_g = live.ffmpeg_available, live.grab_still
+        live.ffmpeg_available = lambda: True
+        live.grab_still = lambda url, width=None: (FAKE_JPEG, "")
+        try:
+            st, b = self.req("GET", "/snapshot?device=" + dev["id"] + "&ch=rtsp&res=640x360")
+            self.assertEqual(st, 200)
+            self.assertEqual(b, FAKE_JPEG)
+        finally:
+            live.ffmpeg_available, live.grab_still = orig_a, orig_g
+
+    def test_rtsp_snapshot_signals_audio_only_when_no_video(self):
+        _, dev = self.add_rtsp()
+        orig_a, orig_g = live.ffmpeg_available, live.grab_still
+        live.ffmpeg_available = lambda: True
+        # ffmpeg found no video track -> audio/metadata-only stream
+        live.grab_still = lambda url, width=None: (b"", "Output file does not contain any stream")
+        try:
+            st, b = self.req("GET", "/snapshot?device=" + dev["id"] + "&ch=rtsp&res=640x360")
+            self.assertEqual(st, 200)
+            self.assertTrue(json.loads(b)["audio_only"])
+        finally:
+            live.ffmpeg_available, live.grab_still = orig_a, orig_g
+
+    def test_audio_stream_pipes_mp3(self):
+        _, dev = self.add_rtsp()
+        orig_avail, orig_open = live.ffmpeg_available, live.open_audio
+        live.ffmpeg_available = lambda: True
+        live.open_audio = lambda url: FakeProc(b"ID3MP3DATA")
+        try:
+            st, b = self.req("GET", f"/audio?device={dev['id']}&ch=rtsp")
+            self.assertEqual(st, 200)
+            self.assertIn(b"MP3DATA", b)
+        finally:
+            live.ffmpeg_available, live.open_audio = orig_avail, orig_open
+
+    def test_rtsp_motion_state_reports_unsupported(self):
+        _, dev = self.add_rtsp()
+        st, b = self.req("GET", "/motion/state?device=" + dev["id"])
+        self.assertEqual(st, 200)
+        self.assertFalse(json.loads(b)["supported"])
+
+    def test_rtsp_reason_messages(self):
+        self.assertIn("no video", server._rtsp_reason("Error during demuxing: Operation timed out"))
+        self.assertIn("authentication", server._rtsp_reason("method DESCRIBE failed: 401 Unauthorized"))
+        self.assertIn("path not found", server._rtsp_reason("failed: 404 Not Found"))
+        self.assertIn("cannot connect", server._rtsp_reason("Connection refused"))
+        # audio/metadata-only stream (no m=video) -> ffmpeg "does not contain any stream"
+        self.assertIn("no video track", server._rtsp_reason(
+            "[out#0/mjpeg @ 0x1] Output file does not contain any stream"))
+
     def test_channels_discovery(self):
         _, dev = self.add_device()
         st, b = self.req("GET", f"/channels?device={dev['id']}")
@@ -148,10 +238,18 @@ class ServerTest(unittest.TestCase):
         st, b = self.req("GET", "/settings")
         self.assertEqual(st, 200)
         self.assertIn("save_path", json.loads(b))
+        self.assertIs(json.loads(b)["motion_popup"], False)  # default off
         newp = os.path.join(self.tmp, "newshots")
         st, b = self.req("PUT", "/settings", {"save_path": newp})
         self.assertEqual(st, 200)
         self.assertEqual(json.loads(b)["save_path"], os.path.abspath(newp))
+
+    def test_motion_popup_setting_round_trips(self):
+        st, b = self.req("PUT", "/settings", {"motion_popup": True})
+        self.assertEqual(st, 200)
+        self.assertIs(json.loads(b)["motion_popup"], True)
+        _, b2 = self.req("GET", "/settings")
+        self.assertIs(json.loads(b2)["motion_popup"], True)
 
     def test_save_writes_max_res_jpeg(self):
         _, dev = self.add_device()
@@ -265,9 +363,89 @@ class ServerTest(unittest.TestCase):
         try:
             st, b = self.req("GET", f"/live?device={dev['id']}&ch=101")
             self.assertEqual(st, 502)
-            self.assertIn(b"Connection refused", b)
+            self.assertIn(b"cannot connect", b)  # ffmpeg "refused" -> friendly reason
         finally:
             live.ffmpeg_available, live.open_mjpeg = orig_avail, orig_open
+
+    def test_playback_returns_recorded_frame(self):
+        _, dev = self.add_device()
+        orig_av, orig_grab = live.ffmpeg_available, playback.grab_frame
+        live.ffmpeg_available = lambda: True
+        playback.grab_frame = lambda url, timeout=25, width=None: (FAKE_JPEG, "")
+        try:
+            st, b = self.req("GET", f"/playback?device={dev['id']}&ch=101&time=2026-07-25T14:00:00")
+            self.assertEqual(st, 200)
+            self.assertEqual(b, FAKE_JPEG)
+        finally:
+            live.ffmpeg_available, playback.grab_frame = orig_av, orig_grab
+
+    def test_playback_failure_reports_502(self):
+        _, dev = self.add_device()
+        orig_av, orig_grab = live.ffmpeg_available, playback.grab_frame
+        live.ffmpeg_available = lambda: True
+        playback.grab_frame = lambda url, timeout=25, width=None: (b"", "404 Not Found")  # no frame
+        try:
+            st, b = self.req("GET", f"/playback?device={dev['id']}&ch=101&time=2026-07-25T14:00:00")
+            self.assertEqual(st, 502)
+            self.assertIn(b"404", b)
+        finally:
+            live.ffmpeg_available, playback.grab_frame = orig_av, orig_grab
+
+    def test_playback_bad_time_400(self):
+        _, dev = self.add_device()
+        orig = live.ffmpeg_available
+        live.ffmpeg_available = lambda: True
+        try:
+            st, _ = self.req("GET", f"/playback?device={dev['id']}&ch=101&time=nope")
+            self.assertEqual(st, 400)
+        finally:
+            live.ffmpeg_available = orig
+
+    def test_events_route_lists_motion(self):
+        _, dev = self.add_device()
+        st, b = self.req("GET", f"/events?device={dev['id']}&ch=101&hours=24")
+        self.assertEqual(st, 200)
+        data = json.loads(b)
+        self.assertEqual(len(data["events"]), 1)
+        self.assertEqual(data["events"][0]["seconds"], 17)
+        self.assertEqual(data["events"][0]["start"], "20260726T080134Z")
+        st2, _ = self.req("GET", "/events?device=nope")
+        self.assertEqual(st2, 404)
+
+    def test_clip_streams_mp4(self):
+        _, dev = self.add_device()
+        orig_av, orig_proc = recordings.ffmpeg_available, recordings.clip_process
+        recordings.ffmpeg_available = lambda: True
+        recordings.clip_process = lambda cfg, ch, start, end: FakeProc(b"MP4CLIPDATA")  # noqa
+        try:
+            st, b = self.req("GET", f"/clip?device={dev['id']}&ch=101"
+                                    "&start=20260726T080134Z&end=20260726T080151Z")
+            self.assertEqual(st, 200)
+            self.assertIn(b"MP4CLIPDATA", b)
+        finally:
+            recordings.ffmpeg_available, recordings.clip_process = orig_av, orig_proc
+
+    def test_clip_requires_ffmpeg(self):
+        _, dev = self.add_device()
+        orig = recordings.ffmpeg_available
+        recordings.ffmpeg_available = lambda: False
+        try:
+            st, b = self.req("GET", f"/clip?device={dev['id']}&ch=101&start=a&end=b")
+            self.assertEqual(st, 503)
+            self.assertIn(b"ffmpeg", b)
+        finally:
+            recordings.ffmpeg_available = orig
+
+    def test_playback_requires_ffmpeg(self):
+        _, dev = self.add_device()
+        orig = live.ffmpeg_available
+        live.ffmpeg_available = lambda: False
+        try:
+            st, b = self.req("GET", f"/playback?device={dev['id']}&ch=101&time=2026-07-25T14:00:00")
+            self.assertEqual(st, 503)
+            self.assertIn(b"ffmpeg", b)
+        finally:
+            live.ffmpeg_available = orig
 
     def test_live_requires_ffmpeg(self):
         _, dev = self.add_device()

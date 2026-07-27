@@ -23,11 +23,10 @@ import threading
 import time
 import urllib.error
 
-from . import camera, config, store
+from . import camera, config
 
 ALERT_PATH = "/ISAPI/Event/notification/alertStream"
 HOLD_SECONDS = 6.0      # a channel stays "active" this long after its last active event
-SAVE_DEBOUNCE = 10.0    # min seconds between motion auto-saves for one channel
 STREAM_TIMEOUT = 60     # per-read socket timeout; a silent stream past it reconnects
 BACKOFF_SECONDS = 10.0  # wait before reconnecting after a stream error
 _TAG_CLOSE = b"</EventNotificationAlert>"
@@ -50,23 +49,13 @@ def _text(root, localname):
     return None
 
 
-def _picture_id(input_id):
-    """Video-input index (e.g. "1") -> picture/stream id ("101")."""
-    try:
-        return f"{int(input_id)}01"
-    except ValueError:
-        return input_id
-
-
 class Monitor:
     """Holds one device's alert-stream connection and its motion state."""
 
-    def __init__(self, device_id, saver=None):
+    def __init__(self, device_id):
         self.device_id = device_id
-        self.saver = saver or store.save_snapshot
         self._lock = threading.Lock()
         self._active = {}      # input(str) -> monotonic ts of last active event
-        self._last_save = {}   # input(str) -> monotonic ts of last auto-save
         self.supported = True
         self.message = "starting"
         self._stop = threading.Event()
@@ -95,6 +84,10 @@ class Monitor:
         while not self._stop.is_set():
             cfg = config.get_cfg(self.device_id)
             if not cfg:            # device deleted -> retire this monitor
+                return
+            if cfg.get("kind") == "rtsp":  # URL-only stream: no ISAPI alert stream to watch
+                self.supported = False
+                self.message = "motion detection not available for an RTSP-only stream"
                 return
             try:
                 resp = camera.open_stream(cfg, ALERT_PATH, timeout=STREAM_TIMEOUT)
@@ -157,31 +150,8 @@ class Monitor:
         if not ch:
             return
         state = (_text(root, "eventState") or "").lower()
-        now = _now()
-        transition = False
         with self._lock:
-            was_active = (now - self._active.get(ch, 0.0)) < HOLD_SECONDS
-            if state == "inactive":
-                self._active[ch] = 0.0
-            else:  # active (or unlabeled -> treat as active)
-                self._active[ch] = now
-                transition = not was_active
-        if transition:
-            self._maybe_save(ch, now)
-
-    def _maybe_save(self, ch, now):
-        with self._lock:
-            if now - self._last_save.get(ch, 0.0) < SAVE_DEBOUNCE:
-                return
-            self._last_save[ch] = now
-        cfg = config.get_cfg(self.device_id)
-        if not cfg:
-            return
-        try:
-            self.saver(cfg, _picture_id(ch), label=config.device_label(self.device_id),
-                       motion=True)
-        except Exception:
-            pass  # a failed save must never kill the monitor
+            self._active[ch] = _now() if state != "inactive" else 0.0
 
 
 # --- module-level manager ---------------------------------------------------
@@ -208,7 +178,8 @@ def start_all():
     """Start a monitor for every configured device (called at server startup so
     motion capture works even with no browser open)."""
     for d in config.list_devices():
-        ensure(d["id"])
+        if d.get("kind") != "rtsp":   # RTSP-only streams have no ISAPI alert stream
+            ensure(d["id"])
 
 
 def stop(device_id):
