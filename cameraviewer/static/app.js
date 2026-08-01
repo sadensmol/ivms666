@@ -23,8 +23,19 @@ async function loadDevices() {
 function fillGroupDatalist() {
   $('groupDatalist').innerHTML = groupList.map(g=>'<option value="'+escapeHtml(g)+'">').join('');
 }
-async function createGroup() {
-  const name = (prompt('New group name:')||'').trim();
+// Create-group uses an INLINE input, not the native prompt() — some browsers block
+// prompt() (e.g. after "don't allow this page to create dialogs"), which made the
+// button silently do nothing. The button reveals the input; Enter submits, Esc cancels.
+function createGroup() {
+  const inp = $('newGroupInput');
+  $('addGroupBtn').hidden = true; inp.hidden = false; inp.value = ''; inp.focus();
+}
+function cancelGroup() {
+  $('newGroupInput').hidden = true; $('addGroupBtn').hidden = false;
+}
+async function submitGroup(name) {
+  name = (name||'').trim();
+  cancelGroup();
   if (!name) return;
   try { groupList = await jfetch('/groups', {method:'POST', body:JSON.stringify({name})}); renderDevices(); }
   catch (e) { setStatus('Could not create group: '+e.message, true); }
@@ -934,6 +945,8 @@ async function saveMotion(){
 $('addBtn').onclick=()=>openAddDevice();
 $('addRtspBtn').onclick=()=>openAddRtsp();
 $('addGroupBtn').onclick=createGroup;
+$('newGroupInput').onkeydown=e=>{ if(e.key==='Enter') submitGroup(e.target.value); else if(e.key==='Escape') cancelGroup(); };
+$('newGroupInput').onblur=cancelGroup;
 $('dIsapi').onchange=updatePathVisibility;
 $('settingsBtn').onclick=openSettings;
 $('setClose').onclick=()=>$('setOverlay').classList.remove('open');

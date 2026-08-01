@@ -277,18 +277,29 @@ def _chunks(seq, size):
         yield seq[i:i + size]
 
 
-def scan_and_verify(hosts, ports, creds, timeout=5, workers=10, verify_workers=None,
+def scan_and_verify(hosts, ports, creds, timeout=5, workers=10,
                     on_found=None, on_attempt=None, on_verified=None, on_host_done=None):
     """Scan a **window of up to `workers` IPs at a time, PORT BY PORT**: probe port 1
     on all IPs in the window in parallel, then port 2 on the same IPs, … up to the
     last configured port; then advance to the next window of IPs.
 
-    **Verification runs on a SEPARATE pool** (`verify_workers`, default = `workers`):
-    the instant a port answers RTSP, its credential + stream probing (`probe_streams`
-    — which can be slow: many logins × vendor paths × channels) is handed to the
-    verify pool and the scan **keeps probing IPs** — a single slow/hanging device
-    never freezes the whole scan. Credentials for one host are still tried one at a
-    time (no per-host lockout); different hosts verify concurrently.
+    **ONE shared budget of `workers` slots covers BOTH activities.** Every unit of
+    network work — probing an IP for RTSP, OR verifying logins on a found port
+    (`enumerate_streams`: logins × vendor paths × channels, which can be slow) —
+    holds one slot **while it runs**, so at most `workers` run AT ONCE across both.
+    A probe frees its slot the moment it finishes; a found port then takes a fresh
+    slot for verification. So if K ports are being login-probed, only `workers - K`
+    slots remain for IP probing; only when ALL `workers` are busy verifying does
+    probing block until a login-probe finishes ("stuck on login probing", by
+    design). Crucially a probe never keeps its slot past the probe itself, so a
+    handful of slow verifications can never stall probing while free slots remain
+    (a real deadlock that did happen when probes held their slot through an ordered
+    collection). A single slow/hanging device only ties up its own one slot — the
+    others keep working. Credentials for one host are tried one at a time (no
+    per-host lockout); different hosts verify concurrently.
+
+    `on_found` fires from the coordinator in host order per port (deterministic),
+    so results stream in the probed order even though probing is concurrent.
 
     Live callbacks (the caller serializes output):
       `on_found(host, port, detail)`  — the instant an RTSP port is detected
@@ -296,41 +307,62 @@ def scan_and_verify(hosts, ports, creds, timeout=5, workers=10, verify_workers=N
       `on_verified(hit)`              — after that port's streams are enumerated
       `on_host_done(done, total, hits)` — as each host's PROBING finishes (progress)
 
-    Returns a flat list of hit dicts:
-      {"host", "port", "detail", "streams": [(user, password, path, vendor), ...]}
-    — one entry per working camera/stream on that port.
+    Returns a flat list of hit dicts (from `enumerate_streams`, plus location):
+      {"host", "port", "detail", "streams": [(user, password, path, vendor), ...],
+       "credential": (user, password) | None, "attempts", "total", "reason"}
+    — one entry per found RTSP port (`streams` has one tuple per working camera).
     """
     total = len(hosts)
     win = max(1, min(workers, total))
-    verify_workers = verify_workers if verify_workers is not None else win
     all_hits = []
     lock = threading.Lock()
     done = [0]
+    # The single shared budget: at most `win` probe-or-verify units in flight.
+    budget = threading.BoundedSemaphore(win)
+
+    def _probe(host, port):
+        # A probe holds its slot ONLY for the probe itself, then frees it in `finally`
+        # — so a slow verification holding other slots can never deadlock the probe
+        # acquire-loop behind slots that only the (not-yet-reached) collection would free.
+        try:
+            return probe_rtsp(host, port, timeout)
+        finally:
+            budget.release()
 
     def _verify(host, port, detail):
-        attempt_cb = ((lambda i, n, u, p: on_attempt(host, port, i, n, u, p)) if on_attempt else None)
-        streams = probe_streams(host, port, creds, realm=_realm_from_detail(detail),
-                                timeout=timeout, on_attempt=attempt_cb)
-        hit = {"host": host, "port": port, "detail": detail, "streams": streams}
-        if on_verified:                       # (fired outside `lock` -> no nested-lock deadlock)
-            on_verified(hit)
-        with lock:
-            all_hits.append(hit)
+        try:
+            attempt_cb = ((lambda i, n, u, p: on_attempt(host, port, i, n, u, p)) if on_attempt else None)
+            result = enumerate_streams(host, port, creds, realm=_realm_from_detail(detail),
+                                       timeout=timeout, on_attempt=attempt_cb)
+            hit = {"host": host, "port": port, "detail": detail, **result}
+            if on_verified:                   # (fired outside `lock` -> no nested-lock deadlock)
+                on_verified(hit)
+            with lock:
+                all_hits.append(hit)
+        finally:
+            budget.release()                  # login-probing slot freed
 
-    with ThreadPoolExecutor(max_workers=win) as probe_ex, \
-            ThreadPoolExecutor(max_workers=max(1, verify_workers)) as verify_ex:
-        futs = []
+    with ThreadPoolExecutor(max_workers=win) as ex:
+        verify_futs = []
         for window in _chunks(hosts, win):
             for port in ports:                              # port-major within the window
-                probed = list(probe_ex.map(
-                    lambda h, _pt=port: (h, *probe_rtsp(h, _pt, timeout)), window))
-                for host, ok, detail in probed:
+                # Probe this port across the window concurrently — each probe holds one
+                # budget slot and frees it as soon as it finishes. `acquire` blocks only
+                # when ALL slots are busy (probing or verifying), so free slots always
+                # get used and probing is paced by whatever login-probing is in flight.
+                probes = []
+                for host in window:
+                    budget.acquire()
+                    probes.append((host, ex.submit(_probe, host, port)))
+                for host, pf in probes:                     # collect IN ORDER -> deterministic on_found
+                    ok, detail = pf.result()                # (_probe already freed its slot)
                     if not ok:
                         continue
                     if on_found:
                         on_found(host, port, detail)
-                    if creds:                               # verify in the background; DON'T block probing
-                        futs.append(verify_ex.submit(_verify, host, port, detail))
+                    if creds:                               # take a fresh slot for verification
+                        budget.acquire()
+                        verify_futs.append(ex.submit(_verify, host, port, detail))
                     else:
                         with lock:
                             all_hits.append({"host": host, "port": port, "detail": detail, "streams": []})
@@ -340,7 +372,7 @@ def scan_and_verify(hosts, ports, creds, timeout=5, workers=10, verify_workers=N
                     d = done[0]
                 if on_host_done:
                     on_host_done(d, total, [])
-        for f in futs:                                      # drain outstanding verifications
+        for f in verify_futs:                               # drain outstanding verifications
             f.result()
     return all_hits
 
@@ -353,42 +385,77 @@ def device_entry(host, rtsp_port, user=None, password=None, path="/Streaming/Cha
     return {"rtsp_url": rtsp_link(host, rtsp_port, path, user=user, password=password)}
 
 
-def find_credential(host, port, creds, probe_path="/Streaming/Channels/101",
-                    timeout=5, on_attempt=None):
-    """Find ONE accepted credential for a known-RTSP host:port. Tries each
-    (user, password) in order, ONE at a time (sequential -> no failed-login
-    lockout), stopping at the first that works. A credential is "accepted" the
-    moment answering the 401 challenge yields anything but another 401 (200 = valid
-    path, 404 = valid login / wrong path). Returns (user, password) or None.
-    `on_attempt(i, n, user, password)` (1-based) fires before each try."""
+def find_credential_ex(host, port, creds, probe_path="/Streaming/Channels/101",
+                        timeout=5, on_attempt=None):
+    """Like `find_credential`, but returns a **diagnostic dict** so callers can tell
+    *why* nothing worked and *how far* it got:
+      {"credential": (user, password) | None,
+       "attempts": <combos actually tried>, "total": len(creds),
+       "reason": "ok" | "no_login" | "conn_dropped",
+       "last": (user, password) | None}   # the LAST combo attempted
+    - "ok"           — a credential was accepted (`credential` set; `attempts` = the
+                       1-based index where it worked).
+    - "conn_dropped" — the socket died mid-scan (`rtsp_describe` code None), so we
+                       stopped early and **NOT every combo was tried** (`attempts` <
+                       `total`). `last` is the credential we were on when it dropped
+                       — surface it so a re-run can deprioritise that login.
+    - "no_login"     — every combo was tried and each got a 401 (`attempts` == `total`).
+    A credential is "accepted" the moment the 401 challenge-answer yields anything
+    but another 401 (200 = valid path, 404 = valid login / wrong path). Sequential,
+    one at a time (no failed-login lockout). `on_attempt(i, n, user, password)`
+    (1-based) fires before each try."""
     total = len(creds)
+    tried = 0
+    last = None
     for i, (user, password) in enumerate(creds, 1):
         if on_attempt:
             on_attempt(i, total, user, password)
+        tried = i
+        last = (user, password)
         code, _ = rtsp_describe(host, port, user, password, probe_path, timeout)
-        if code is None:
-            return None                 # connection died -> stop trying this port
+        if code is None:                # connection died -> stop; remaining combos untried
+            return {"credential": None, "attempts": tried, "total": total,
+                    "reason": "conn_dropped", "last": last}
         if code != 401:                 # got past auth -> this login works
-            return (user, password)
-    return None
+            return {"credential": (user, password), "attempts": tried, "total": total,
+                    "reason": "ok", "last": last}
+    return {"credential": None, "attempts": tried, "total": total, "reason": "no_login", "last": last}
 
 
-def probe_streams(host, port, creds, realm="", timeout=5, on_attempt=None,
-                  max_channels=MAX_CHANNELS):
-    """Enumerate every working stream on a found RTSP port, vendor- and
-    channel-aware:
+def find_credential(host, port, creds, probe_path="/Streaming/Channels/101",
+                    timeout=5, on_attempt=None):
+    """Find ONE accepted credential for a known-RTSP host:port, or None. Thin
+    wrapper over `find_credential_ex` — use that when you also need the failure
+    reason / attempt count."""
+    return find_credential_ex(host, port, creds, probe_path, timeout, on_attempt)["credential"]
+
+
+def enumerate_streams(host, port, creds, realm="", timeout=5, on_attempt=None,
+                      max_channels=MAX_CHANNELS):
+    """Enumerate every working stream on a found RTSP port AND report why it found
+    none, vendor- and channel-aware:
       1. infer the vendor from the 401 `realm` (`vendors.detect`);
       2. find ONE working credential (sequential; `on_attempt` per try);
       3. with it, walk vendors in best-guess order (`vendors.enumeration_order`) and
          let each enumerate its channels (stopping at the first empty channel) —
          the first vendor that yields any stream wins.
-    Returns [(user, password, path, vendor_name), …] — one per camera/stream."""
+    Returns a dict:
+      {"streams": [(user, password, path, vendor_name), …],   # one per camera/stream
+       "credential": (user, password) | None,
+       "attempts": <combos actually tried>, "total": len(creds),
+       "reason": "ok" | "no_login" | "conn_dropped" | "no_path",
+       "last": (user, password) | None}   # last combo attempted (the one it dropped on)
+    "no_path" is the important new one: a credential **was accepted** but no vendor
+    stream path matched — the login is fine, the URL schema isn't (so reporting
+    "N combos tried" would be misleading; often only one combo was tried)."""
     guess = vendors.detect(realm)
     probe_path = guess.probe_path() if guess else "/Streaming/Channels/101"
-    got = find_credential(host, port, creds, probe_path, timeout, on_attempt)
-    if not got:
-        return []
-    user, password = got
+    cred = find_credential_ex(host, port, creds, probe_path, timeout, on_attempt)
+    result = {"streams": [], "credential": cred["credential"], "attempts": cred["attempts"],
+              "total": cred["total"], "reason": cred["reason"], "last": cred.get("last")}
+    if not cred["credential"]:
+        return result                   # reason already "no_login" / "conn_dropped"
+    user, password = cred["credential"]
 
     def describe(path):
         return rtsp_describe(host, port, user, password, path, timeout)[0]
@@ -396,5 +463,16 @@ def probe_streams(host, port, creds, realm="", timeout=5, on_attempt=None,
     for vendor in vendors.enumeration_order(realm):
         paths = vendor.streams(describe, max_channels)
         if paths:
-            return [(user, password, p, vendor.name) for p in paths]
-    return []
+            result["streams"] = [(user, password, p, vendor.name) for p in paths]
+            result["reason"] = "ok"
+            return result
+    result["reason"] = "no_path"        # login accepted, but no stream path matched
+    return result
+
+
+def probe_streams(host, port, creds, realm="", timeout=5, on_attempt=None,
+                  max_channels=MAX_CHANNELS):
+    """Just the list of working streams for a found RTSP port. Thin wrapper over
+    `enumerate_streams` — use that when you also need the credential / attempt
+    count / failure reason."""
+    return enumerate_streams(host, port, creds, realm, timeout, on_attempt, max_channels)["streams"]

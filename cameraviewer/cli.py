@@ -1,6 +1,7 @@
 """Command-line entrypoint: launch the GUI, or `discover` cameras from a terminal."""
 
 import argparse
+import shutil
 import sys
 import threading
 
@@ -44,18 +45,35 @@ class _LiveRegion:
     Permanent lines scroll ABOVE it via print_above(); the live block below shows
     one line per host currently being verified plus a host-progress line. On a
     non-tty (piped/redirected) all cursor control is skipped so output stays a
-    clean sequence of permanent lines."""
+    clean sequence of permanent lines.
+
+    Two hard rules keep the block from ever leaking into scrollback (the flood of
+    repeated 'trying …' lines): every line is truncated to the terminal WIDTH so
+    it never wraps onto a second physical row, and the block is capped to the
+    terminal HEIGHT (surplus hosts collapse into one '+N more' line). Both matter
+    because `render`'s `\\033[nA` cursor-up cannot climb above the top of the
+    screen — if the block is taller than the viewport (or a line wraps), the move
+    clamps and the rows that already scrolled off are never cleared, so each
+    redraw stacks a fresh copy below the stale one."""
 
     def __init__(self):
         self.tty = sys.stdout.isatty()
-        self.n = 0  # number of live lines currently drawn
+        self.n = 0  # physical live lines currently drawn (== the last render's count)
+
+    def _fit(self, lines):
+        cols, rows = shutil.get_terminal_size((100, 24))
+        cap = max(1, rows - 1)                        # leave a row so cursor-up never clamps
+        if len(lines) > cap:                          # collapse the overflow into one line
+            lines = lines[: cap - 1] + [f"      … +{len(lines) - cap + 1} more verifying"]
+        return [line[: max(1, cols - 1)] for line in lines]   # truncate -> never wrap
 
     def render(self, lines):
         if not self.tty:
             return
+        lines = self._fit(lines)
         out = f"\033[{self.n}A" if self.n else ""   # up to the region's top line
         out += "\033[0J"                            # clear from cursor to end of screen
-        out += "".join(line[:240] + "\n" for line in lines)  # redraw the block
+        out += "".join(line + "\n" for line in lines)  # redraw the block
         sys.stdout.write(out)
         sys.stdout.flush()
         self.n = len(lines)
@@ -147,9 +165,21 @@ def run_rtsp_scan(ns):
                 for su, sp, path, _v in hit["streams"]:
                     region.print_above(f"       {scan.rtsp_link(hit['host'], hit['port'], path, user=su, password=sp)}")
                     entries.append(scan.device_entry(hit["host"], hit["port"], su, sp, path))
-            elif creds:
-                region.print_above(f"  → no login/streams   {hit['host']}:{hit['port']}   "
-                                   f"({len(creds)} combo(s) tried)")
+            elif hit.get("credential"):        # login worked, but no stream path matched
+                u, p = hit["credential"]
+                region.print_above(f"  → login OK but no stream path matched   "
+                                   f"{hit['host']}:{hit['port']}   {u}:{p}   "
+                                   f"(creds fine, URL schema unknown)")
+            elif hit.get("reason") == "conn_dropped":
+                lu, lp = hit.get("last") or (None, None)
+                where = f" on {lu}:{lp}" if lu is not None else ""
+                region.print_above(f"  → connection dropped   {hit['host']}:{hit['port']}   "
+                                   f"(after {hit['attempts']}/{hit['total']} combo(s){where} — not all "
+                                   f"tried; deprioritise that login next run)")
+            elif creds:                        # every combo tried, each rejected
+                tried = hit.get("attempts", len(creds))
+                region.print_above(f"  → no valid login   {hit['host']}:{hit['port']}   "
+                                   f"({tried}/{len(creds)} combo(s) tried)")
             else:
                 entries.append(scan.device_entry(hit["host"], hit["port"]))   # no-creds -> anonymous default
             if entries:                                                        # append to the output file NOW

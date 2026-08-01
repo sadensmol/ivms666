@@ -72,25 +72,58 @@ python3 -m cameraviewer import --file found.json                 # load scan out
 > all IPs in the window at once, then port 2 on the **same** IPs, … up to the last
 > configured port — then advances to the next window of IPs. (So it is NOT "every
 > IP on port 554, then every IP on the next port"; it's the requested "these N IPs
-> across all ports, then the next N IPs".) **Verification runs on a SEPARATE pool**
-> (`verify_workers`, default = `workers`): the instant a port answers RTSP, its
-> `probe_streams` (which can be slow — logins × vendor paths × channels) is
-> `submit()`ed to the verify pool and the **probing keeps going**, so one
-> slow/hanging device never freezes the scan (the earlier "0/61229 hosts, stuck on
-> login" bug). `on_host_done` fires as soon as a window's **probing** finishes
-> (progress advances immediately); the `all_hits` list and `done` counter are
-> guarded by a lock, and callbacks fire **outside** that lock so the scan-lock and
-> the CLI's output-lock never nest (no deadlock). Credentials for one host are
-> still tried one at a time (no per-host lockout); different hosts verify
-> concurrently. Live
+> across all ports, then the next N IPs".) **ONE shared budget of `workers` slots
+> covers BOTH activities** (`scan.scan_and_verify` — a single
+> `BoundedSemaphore(win)`, `win = min(--parallel, #hosts)`): every unit of network
+> work — probing an IP, OR verifying logins on a found port (`enumerate_streams`,
+> slow: logins × vendor paths × channels) — holds **one** slot **while it runs**,
+> so **at most `workers` run at once across both**. A probe (`_probe`) frees its
+> slot the instant it finishes (in its `finally`); a found port then **acquires a
+> fresh slot** for verification. So if K ports are login-probing, only `workers −
+> K` slots are free for IP probing, and only when ALL `workers` are busy verifying
+> does probing **block until a login-probe finishes** ("stuck on login probing",
+> by design — that's the requested behaviour, and it's why the earlier "+68
+> verifying" pile-up is gone: we never race ahead of verification). **A probe must
+> NEVER keep its slot past the probe itself** — an earlier version handed the
+> probe's slot straight to verification and released it only in a later *ordered
+> collection* loop, so a few slow verifications holding slots **deadlocked the next
+> port's acquire-loop** (symptom: "0/63934 hosts · 13 RTSP · 7 verifying" — 7 busy,
+> 18 free, yet probing frozen, because the 18 "free" threads held uncollected
+> slots the stuck acquire-loop could never release). A single slow/hanging device
+> only ties up its own one slot; the rest keep working. `on_found` fires from the coordinator
+> **in host order per port** (deterministic streaming) even though probing is
+> concurrent. `on_host_done` fires as a window's probing finishes; `all_hits` and
+> the `done` counter are lock-guarded, and callbacks fire **outside** that lock so
+> the scan-lock and the CLI's output-lock never nest (no deadlock). Credentials
+> for one host are tried one at a time (no per-host lockout); different hosts
+> verify concurrently. (There is no longer a separate verify pool /
+> `verify_workers`; the single budget replaced it.) Live
 > callbacks drive a **multi-line live region** (`cli._LiveRegion`, ANSI cursor
 > control — cursor-up + clear-to-end-of-screen, redrawn under a lock): permanent
-> lines scroll ABOVE it (`on_found` → `✓ RTSP host:port`; `on_verified` →
-> `→ login OK …` / "no working login"), while the live block BELOW shows one line
+> lines scroll ABOVE it (`on_found` → `✓ RTSP host:port`; `on_verified` prints an
+> **accurate outcome from `enumerate_streams`'s `reason`** — `→ login OK …` with
+> the stream links, or `→ login OK but no stream path matched` (creds fine, URL
+> schema unknown — `reason=no_path`), or `→ connection dropped (after i/n on
+> user:pass — deprioritise that login next run)` (`conn_dropped` — socket died
+> mid-scan, NOT all combos tried; `enumerate_streams`/`find_credential_ex` return
+> `last` = the combo it dropped on so the message names the offending login), or `→ no valid
+> login (i/n combo(s) tried)` (`no_login` — every combo tried, each 401). The old
+> message always printed `len(creds)` "combos tried" even when a login was found
+> or the scan stopped early — misleading; now `attempts` is the real count), while the live block BELOW shows one line
 > per host currently being verified — `host:port  trying user:pass (i/n)`, updated
+> **in place**, one row per host — updated
 > by `on_attempt(host, port, i, n, user, password)` threaded through to
 > `find_credential` — plus a bottom `N/M hosts · X RTSP · Y verified · Z streams` line
-> (`on_host_done`). `_LiveRegion` is a **no-op on a non-tty** (piped/redirected),
+> (`on_host_done`). **Two flood guards (`_LiveRegion._fit`) are non-negotiable:**
+> each line is truncated to the terminal **width** (else it wraps onto a 2nd
+> physical row) and the block is capped to the terminal **height** (surplus hosts
+> collapse into one `… +N more verifying` line). Both matter because `render`'s
+> `\033[nA` cursor-up **cannot climb above the top of the screen** — a block taller
+> than the viewport (or a wrapped line) makes the move clamp, the scrolled-off rows
+> are never cleared, and every redraw stacks a fresh copy below the stale one. That
+> was the "tons of repeated `trying …` lines flooding the console" bug (with the
+> default `--parallel 25`, up to ~26 live rows easily exceed a small/split pane).
+> `_LiveRegion` is a **no-op on a non-tty** (piped/redirected),
 > so captured output is just the clean sequence of permanent lines. Ctrl+C exits
 > cleanly (caught in `cli.main`; in-flight probes finish on their socket timeout).
 > Each verified hit is written to `--output` (default `rtsp-scan-output.json`)
@@ -427,7 +460,7 @@ cameraviewer/
   live.py                   # RTSP->MJPEG via ffmpeg (Live view); rtsp_url (stored URL for kind=rtsp) + check + open_mjpeg + grab_still (one frame, for RTSP tiles/Save); -timeout so dead streams fail fast; SAR->square-pixel so streams aren't squished
   playback.py               # recorded playback: one still at a chosen time via RTSP tracks + ffmpeg; to_span + playback_url + grab_frame (serialized to 1 RTSP session, retries RTSP 453, in-memory frame cache) + rtsp_priority() (clip playback pauses grabs)
   recordings.py             # motion event log + clip video: list_events (CMSearch POST /ISAPI/ContentMgmt/search on the motion track) + clip_process (RTSP playback -> ffmpeg fragmented MP4, audio dropped)
-  scan.py                   # rtsp-scan: windowed probe (window of --parallel IPs, port-major) + verify on a SEPARATE pool so slow login/stream probing never blocks probing — scan_and_verify + probe_rtsp + find_credential + probe_streams (vendor+channel enumeration) + expand_range/expand_ranges + rtsp_link + device_entry
+  scan.py                   # rtsp-scan: windowed probe (window of --parallel IPs, port-major) + ONE shared budget of `workers` slots for probe+verify combined (a found port hands its slot from probing to verifying; total in-flight <= workers) — scan_and_verify + probe_rtsp + find_credential(_ex) + enumerate_streams (vendor+channel enumeration + credential/attempts/reason) + probe_streams (streams-only wrapper) + expand_range/expand_ranges + rtsp_link + device_entry
   vendors/                  # one module per camera/DVR family (Vendor: realm keywords + per-stream path groups + channel walk w/ early-stop). __init__.detect(realm)/enumeration_order(); add a device here, not in scan.py
   default_config.json       # USER-OWNED runtime input (devices=[], scan range/ports). Assistant: never read/edit. config.py reads it at runtime only.
   web.py                    # loads static/index.html + static/app.js

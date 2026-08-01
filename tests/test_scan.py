@@ -7,6 +7,7 @@ import hashlib
 import re
 import socketserver
 import threading
+import time
 import unittest
 
 from cameraviewer import scan, vendors
@@ -212,8 +213,12 @@ class TestScanAndVerify(unittest.TestCase):
         # a found port whose credential/stream probing hangs must NOT freeze the scan:
         # host progress should reach `total` while verification is still running.
         gate = threading.Event()
-        orig = scan.probe_streams
-        scan.probe_streams = lambda *a, **k: ([] if gate.wait(5) else [])   # block until released
+        orig = scan.enumerate_streams
+
+        def _blocking_enum(*a, **k):                       # block until released
+            gate.wait(5)
+            return {"streams": [], "credential": None, "attempts": 0, "total": 1, "reason": "no_login"}
+        scan.enumerate_streams = _blocking_enum
         reached_total = threading.Event()
         result = {}
         try:
@@ -231,7 +236,43 @@ class TestScanAndVerify(unittest.TestCase):
             self.assertEqual(len(result["hits"]), 3)
         finally:
             gate.set()
-            scan.probe_streams = orig
+            scan.enumerate_streams = orig
+
+    def test_a_stuck_verification_does_not_stall_probing_of_other_ports(self):
+        # Regression: one slow verification holds a slot; probing the REMAINING
+        # ports/slots must keep going and progress must still reach `total`. (The
+        # bug: probes held their slot through an ordered collection, so a single
+        # stuck verify deadlocked the next port's acquire-loop even with free slots.)
+        gate = threading.Event()
+        calls = [0]
+        clock = threading.Lock()
+        orig = scan.enumerate_streams
+
+        def _enum(*a, **k):                         # only the FIRST verify blocks
+            with clock:
+                first = calls[0] == 0
+                calls[0] += 1
+            if first:
+                gate.wait(5)
+            return {"streams": [], "credential": None, "attempts": 0, "total": 1, "reason": "no_login"}
+        scan.enumerate_streams = _enum
+        reached_total = threading.Event()
+        try:
+            with FakeRTSP({"admin": "x"}) as a, FakeRTSP({"admin": "x"}) as b:
+                hosts = ["127.0.0.1"] * 3            # win=3; both ports found on every slot
+                ports = [str(a.port), str(b.port)]
+                th = threading.Thread(target=lambda: scan.scan_and_verify(
+                    hosts, ports, [("admin", "x")], timeout=3, workers=3,
+                    on_host_done=lambda d, t, h: d == t and reached_total.set()))
+                th.start()
+                # 1 slot is stuck on the blocked verify, but 2 remain -> probing of the
+                # 2nd port must complete and progress must reach 3/3 within the timeout.
+                self.assertTrue(reached_total.wait(3), "probing stalled behind one stuck verification")
+                gate.set()
+                th.join(5)
+        finally:
+            gate.set()
+            scan.enumerate_streams = orig
 
     def test_reports_progress_per_host_slot(self):
         seen = []
@@ -374,6 +415,80 @@ class TestProbeStreams(unittest.TestCase):
         with FakeRTSP({"admin": "x"}, valid_paths={"/live/ch00_0"}, realm=realm) as srv:
             streams = scan.probe_streams(srv.host, srv.port, [("admin", "x")], realm=realm, timeout=3)
         self.assertEqual([(p, v) for _, _, p, v in streams], [("/live/ch00_0", "XiongMai")])
+
+
+class TestEnumerateStreamsReason(unittest.TestCase):
+    """The diagnostic that distinguishes "bad creds" from "good creds, no path"."""
+
+    def test_ok_reports_credential(self):
+        with FakeRTSP({"admin": "x"}, valid_paths=_HIK1, realm="Embedded Net DVR") as srv:
+            r = scan.enumerate_streams(srv.host, srv.port, [("admin", "x")],
+                                       realm="Embedded Net DVR", timeout=3)
+        self.assertEqual(r["reason"], "ok")
+        self.assertEqual(r["credential"], ("admin", "x"))
+        self.assertTrue(r["streams"])
+
+    def test_no_login_tried_every_combo(self):
+        with FakeRTSP({"admin": "letmein"}, valid_paths=_HIK1) as srv:
+            combos = scan.credential_combos(["admin", "root"], ["a", "b"])   # 4, none valid
+            r = scan.enumerate_streams(srv.host, srv.port, combos, timeout=3)
+        self.assertEqual(r["reason"], "no_login")
+        self.assertIsNone(r["credential"])
+        self.assertEqual((r["attempts"], r["total"]), (4, 4))
+
+    def test_no_path_when_login_ok_but_no_stream_matches(self):
+        # creds accepted (404 != 401) but NO path returns 200 -> login is fine, the
+        # URL schema isn't. Must NOT claim "all combos tried" — it stopped at the 1st.
+        with FakeRTSP({"admin": "x"}, valid_paths=set(), realm="Embedded Net DVR") as srv:
+            r = scan.enumerate_streams(srv.host, srv.port,
+                                       scan.credential_combos(["admin"], ["x", "y", "z"]),
+                                       realm="Embedded Net DVR", timeout=3)
+        self.assertEqual(r["reason"], "no_path")
+        self.assertEqual(r["credential"], ("admin", "x"))
+        self.assertEqual(r["streams"], [])
+        self.assertEqual(r["attempts"], 1)              # found the login on the 1st try
+
+    def test_conn_dropped_stops_early_and_reports_the_dropped_login(self):
+        # unreachable host -> socket error -> stop after the 1st attempt, not all,
+        # and report WHICH login it dropped on (so a re-run can deprioritise it).
+        r = scan.find_credential_ex("127.0.0.1", 1, [("a", "1"), ("b", "2")], timeout=1)
+        self.assertEqual(r["reason"], "conn_dropped")
+        self.assertEqual((r["attempts"], r["total"]), (1, 2))
+        self.assertEqual(r["last"], ("a", "1"))         # dropped on the first combo
+
+
+class TestSharedBudget(unittest.TestCase):
+    def test_probe_plus_verify_never_exceed_workers(self):
+        # ONE budget of `workers`: probing an IP and verifying logins draw from the
+        # same pool, so their COMBINED concurrency must never exceed it.
+        lock = threading.Lock()
+        live = [0]
+        peak = [0]
+
+        def _track(fn):
+            def wrapped(*a, **k):
+                with lock:
+                    live[0] += 1
+                    peak[0] = max(peak[0], live[0])
+                try:
+                    time.sleep(0.02)
+                    return fn(*a, **k)
+                finally:
+                    with lock:
+                        live[0] -= 1
+            return wrapped
+
+        op, oe = scan.probe_rtsp, scan.enumerate_streams
+        scan.probe_rtsp, scan.enumerate_streams = _track(op), _track(oe)
+        try:
+            with FakeRTSP({"admin": "x"}, valid_paths=_HIK1, realm="Embedded Net DVR") as srv:
+                hosts = ["127.0.0.1"] * 8
+                scan.scan_and_verify(hosts, [str(srv.port)], [("admin", "x")],
+                                     timeout=3, workers=3)
+        finally:
+            scan.probe_rtsp, scan.enumerate_streams = op, oe
+        self.assertLessEqual(peak[0], 3)
+        self.assertGreater(peak[0], 1)                  # sanity: it really did run concurrently
 
 
 class TestVendors(unittest.TestCase):
