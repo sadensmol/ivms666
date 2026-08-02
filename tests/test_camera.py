@@ -3,7 +3,7 @@
 import unittest
 import urllib.error
 
-from cameraviewer import camera
+import camera
 from tests.helpers import FakeCamera, FAKE_JPEG, streaming_channels_xml, video_inputs_xml
 
 CFG = {"host": "h", "port": "1", "user": "u", "password": "p"}

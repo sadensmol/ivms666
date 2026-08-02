@@ -15,7 +15,7 @@ import subprocess
 import time
 from datetime import datetime
 
-from . import camera, live, playback
+import camera, live, playback
 
 _offset_cache = {}  # host -> (offset_secs, expiry_monotonic)
 

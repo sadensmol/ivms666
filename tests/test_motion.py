@@ -3,7 +3,7 @@
 import re
 import unittest
 
-from cameraviewer import motion
+import motion
 from tests.helpers import FakeCamera, OK_RESP, all_on_gridmap, motion_xml
 
 CFG = {"host": "h", "port": "1", "user": "u", "password": "p"}

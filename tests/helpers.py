@@ -1,12 +1,12 @@
 """Shared test helpers: a fake camera transport and ISAPI payload builders.
 
-The fake patches `cameraviewer.camera.camera_get` / `camera_put`, the lowest
+The fake patches `camera.camera_get` / `camera_put`, the lowest
 network layer, so the *real* discovery and motion logic runs on top of it.
 """
 
 import io
 
-from cameraviewer import camera, motion
+import camera, motion
 
 
 class FakeProc:

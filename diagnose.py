@@ -31,7 +31,7 @@ all via read-modify-write that preserves everything else. Not auto-fixable
 import re
 from datetime import datetime, timedelta, timezone
 
-from . import camera, motion
+import camera, motion
 
 CLOCK_TOLERANCE = 120  # seconds; flag the DVR clock if it's off by more than this
 TIME_EP = "/ISAPI/System/time"

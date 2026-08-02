@@ -2,7 +2,7 @@
 
 import unittest
 
-from cameraviewer import recordings
+import recordings
 from tests.helpers import FakeCamera, cmsearch_result_xml
 
 

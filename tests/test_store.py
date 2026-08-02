@@ -4,7 +4,7 @@ import os
 import tempfile
 import unittest
 
-from cameraviewer import config, store
+import config, store
 from tests.helpers import FAKE_JPEG, FakeCamera
 
 
@@ -18,7 +18,10 @@ class StoreTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self._orig_path = config.CONFIG_PATH
+        self._orig_legacy = config.LEGACY_CONFIG_PATH
         config.CONFIG_PATH = os.path.join(self.tmp, "cfg.json")
+        # keep the pre-rename migration away from the real ~/.camera_viewer.json
+        config.LEGACY_CONFIG_PATH = os.path.join(self.tmp, "legacy.json")
         self.save_dir = os.path.join(self.tmp, "shots")
         config._state = {"devices": [], "settings": {"save_path": self.save_dir}}
         self.fake = FakeCamera(camera_handler)
@@ -27,6 +30,7 @@ class StoreTest(unittest.TestCase):
     def tearDown(self):
         self.fake.__exit__()
         config.CONFIG_PATH = self._orig_path
+        config.LEGACY_CONFIG_PATH = self._orig_legacy
         config._state = {"devices": []}
 
     def _cfg(self):

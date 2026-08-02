@@ -14,11 +14,28 @@ from urllib.parse import unquote
 
 AGENTGREEN_PORT = "8090"   # default management port for "agentgreen" devices
 
-LISTEN_HOST = "127.0.0.1"
-LISTEN_PORT = 8777
-CONFIG_PATH = os.path.expanduser("~/.camera_viewer.json")
+
+def _env_port(name, default):
+    """Read a port from the environment; a junk value falls back, never crashes."""
+    try:
+        return int(os.environ.get(name) or default)
+    except ValueError:
+        return default
+
+
+# Bind address is env-overridable because the same code runs two ways: locally it
+# must stay on loopback (the app has no auth of its own), while in a container it
+# has to listen on 0.0.0.0 for the tunnel sidecar to reach it. The DEFAULT stays
+# loopback so nothing is ever exposed by accident.
+LISTEN_HOST = os.environ.get("CV_LISTEN_HOST") or "127.0.0.1"
+LISTEN_PORT = _env_port("CV_LISTEN_PORT", 8777)
+# HOME-relative, so pointing HOME at a mounted volume persists config + saves.
+CONFIG_PATH = os.path.expanduser("~/.ivms666.json")
+# Pre-rename location; `load` migrates it once so an existing install keeps its
+# devices (and its credentials) without a manual move.
+LEGACY_CONFIG_PATH = os.path.expanduser("~/.camera_viewer.json")
 # Where snapshots (motion auto-captures + manual saves) are written by default.
-DEFAULT_SAVE_PATH = os.path.expanduser("~/CameraViewer")
+DEFAULT_SAVE_PATH = os.path.expanduser("~/ivms666")
 # Bundled, secret-free defaults shipped with the app (no host/creds — the live
 # config with secrets lives only in CONFIG_PATH, 0600, outside the repo).
 DEFAULTS_PATH = os.path.join(os.path.dirname(__file__), "default_config.json")
@@ -45,9 +62,30 @@ _state = {"devices": list(_DEFAULTS.get("devices") or []),
 _lock = threading.Lock()
 
 
+def _migrate_legacy():
+    """Adopt a pre-rename ~/.camera_viewer.json, once.
+
+    Copy rather than rename: the old file keeps working as a fallback if the
+    rename turns out to be a mistake. Only ever runs when the new path does not
+    exist yet, so it can never clobber current config.
+    """
+    if os.path.exists(CONFIG_PATH) or not os.path.exists(LEGACY_CONFIG_PATH):
+        return
+    try:
+        with open(LEGACY_CONFIG_PATH, "rb") as src:
+            data = src.read()
+        fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as dst:
+            dst.write(data)
+        print(f"Migrated {LEGACY_CONFIG_PATH} -> {CONFIG_PATH}")
+    except OSError as e:
+        print(f"Warning: could not migrate {LEGACY_CONFIG_PATH}: {e}")
+
+
 def load():
     """Load persisted state from CONFIG_PATH (no-op if the file is absent)."""
     global _state
+    _migrate_legacy()
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
             data = json.load(f)

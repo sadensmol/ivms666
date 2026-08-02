@@ -1,0 +1,33 @@
+# Droplet stack for ivms666.sadensmol.com. See README.md → Deployment.
+#
+# Copied to /opt/ivms666/docker-compose.yml by .github/workflows/deploy.yml.
+# Reads TUNNEL_TOKEN from /opt/ivms666/.env, which is created by hand on the
+# droplet and deliberately NOT stored in GitHub.
+name: ivms666
+
+services:
+  app:
+    image: ghcr.io/sadensmol/ivms666:latest
+    restart: unless-stopped
+    # NO `ports:` — on purpose. The app has no authentication of its own, so it
+    # must never be reachable from the host or the internet. Its only route in is
+    # the cloudflared sidecar on this private network, which sits behind
+    # Cloudflare Access. Publishing a port here would bypass Access entirely.
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+    volumes:
+      # Config (0600, holds DVR credentials) + user-initiated saves. Never a
+      # data cache: the DVR stays the single source of truth.
+      - cv-data:/data
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?create /opt/ivms666/.env with TUNNEL_TOKEN=...}
+    depends_on:
+      - app
+
+volumes:
+  cv-data:

@@ -1,4 +1,4 @@
-# CLAUDE.md — Camera Viewer (ivms666)
+# CLAUDE.md — ivms666 (camera viewer)
 
 Guidance for working in this repo. Read before editing.
 
@@ -12,7 +12,7 @@ Guidance for working in this repo. Read before editing.
 > `rtsp-scan --output`. There is no background "auto-capture on motion" — it was
 > removed for exactly this reason.)
 
-> **HARD RULE — the *assistant* must never touch `cameraviewer/default_config.json`.**
+> **HARD RULE — the *assistant* must never touch `default_config.json`.**
 > NEVER open, read, edit, or overwrite it with your tools. It is a
 > **user-owned runtime input file** the user maintains by hand. The running
 > *program* reads it at runtime (`config.default_scan` → `scan.range`,
@@ -38,12 +38,12 @@ standard library only**. Keep it that way.
 
 Run it:
 ```
-python3 camera_viewer.py            # launches server + opens browser
-python3 -m cameraviewer discover --user admin --password '...'   # CLI channel list
-python3 -m cameraviewer rtsp-scan --range 192.168.1.0/24         # find RTSP ports + print links
-python3 -m cameraviewer rtsp-scan                                # no args -> scan.range/ports from cameraviewer/default_config.json
-python3 -m cameraviewer rtsp-scan --host <ip> --logins admin,root --passwords 12345,admin --output found.json
-python3 -m cameraviewer import --file found.json                 # load scan output into the app (~/.camera_viewer.json)
+python3 ivms666.py            # launches server + opens browser
+python3 ivms666.py discover --user admin --password '...'   # CLI channel list
+python3 ivms666.py rtsp-scan --range 192.168.1.0/24         # find RTSP ports + print links
+python3 ivms666.py rtsp-scan                                # no args -> scan.range/ports from default_config.json
+python3 ivms666.py rtsp-scan --host <ip> --logins admin,root --passwords 12345,admin --output found.json
+python3 ivms666.py import --file found.json                 # load scan output into the app (~/.ivms666.json)
 ```
 
 > **rtsp-scan credential verification + output → import (the setup flow):**
@@ -60,7 +60,7 @@ python3 -m cameraviewer import --file found.json                 # load scan out
 > (`vendors.detect` — `Embedded Net DVR`→Hikvision, `Login to <32-hex hash>`→XiongMai
 > (XM OEM), a bare serial / `Login to <serial>`→Dahua-family, …), and that vendor's
 > stream-path schemas are tried first
-> (then the others, then Generic). Each vendor (one module in `cameraviewer/vendors/`)
+> (then the others, then Generic). Each vendor (one module in `vendors/`)
 > groups **alternate syntaxes per stream** so a camera yields ONE url (canonical
 > `/Streaming/Channels/101` wins over the `ISAPI`/`h264` aliases), and walks
 > channels 1..`MAX_CHANNELS` (8), **stopping at the first channel with no stream**
@@ -150,7 +150,7 @@ python3 -m cameraviewer import --file found.json                 # load scan out
 ## The target device (known facts)
 
 - Target: a real Hikvision OEM DVR. **Its IP, ports, and credentials are NOT in
-  this repo** — they live only in `~/.camera_viewer.json` (0600). Never hardcode
+  this repo** — they live only in `~/.ivms666.json` (0600). Never hardcode
   them into source or docs. Treat writes to it carefully.
 - Identity: `Server: DNVRS-Webs`, Digest realm `DVRNVRDVS` → **Hikvision OEM DVR**, ~2015 firmware.
 - Auth: **HTTP Digest** (Basic also offered). `urllib` handles both via
@@ -260,7 +260,7 @@ python3 -m cameraviewer import --file found.json                 # load scan out
 - A `404/501/403` on the alert stream marks the device "unsupported" and the
   monitor **stops** (don't hammer — a repeated 403 risks the write-lockout).
 - **Saving** is server-side (`store.save_snapshot`) to the configured folder
-  (header ⚙ Settings → `save_path`, default `~/CameraViewer`), always at
+  (header ⚙ Settings → `save_path`, default `~/ivms666`), always at
   `camera.MAX_STILL_RES` (720p — this DVR's max still). Manual **Save** and motion
   auto-capture use the same path. The browser can't write arbitrary paths, so the
   path is a server setting, not a browser download.
@@ -448,28 +448,29 @@ one device per URL.
 
 ## Architecture / structure to follow
 
+Flat layout — every module lives at the repo root; there is no package. Imports
+are plain (`import camera`), and `python3 ivms666.py` is the only entrypoint.
+
 ```
-camera_viewer.py            # thin launcher -> cameraviewer.cli.main()
-cameraviewer/
-  config.py                 # device store + JSON persistence (~/.camera_viewer.json, 0600); unified device model (is_isapi/is_rtsp, _parse_rtsp_url -> host/rtsp_port/user/password/path, agentgreen_port); named groups (list/create/delete_group); app settings (save_path, motion_popup); device-file import/export
-  camera.py                 # ISAPI HTTP (get/put/open_stream), snapshot, MAX_STILL_RES, channel discovery, safe XML parse
-  motion.py                 # gridMap codec + get_motion / set_motion (read-modify-write)  [detection AREA editor]
-  events.py                 # motion ALERT stream: per-device daemon watches /ISAPI/Event/notification/alertStream, tracks per-channel VMD state (hold window) for the live badge/popup (skips kind=rtsp). get_state / start_all / ensure / stop
-  store.py                  # server-side snapshot saving to config save_path (save_snapshot = ISAPI still; save_bytes = pre-grabbed bytes, used for RTSP)
-  diagnose.py               # per-device health check + safe auto-fix. Live channels: motion enabled/area, VMD email+center linkage, motion-rec 10s pre/post, max-res. Unused channels (NO VIDEO input or hidden tile): only "recording left on" -> disable track. Device-wide: SMTP + DVR clock (System/time) skew -> set correct local time
-  live.py                   # RTSP->MJPEG via ffmpeg (Live view); rtsp_url (stored URL for kind=rtsp) + check + open_mjpeg + grab_still (one frame, for RTSP tiles/Save); -timeout so dead streams fail fast; SAR->square-pixel so streams aren't squished
-  playback.py               # recorded playback: one still at a chosen time via RTSP tracks + ffmpeg; to_span + playback_url + grab_frame (serialized to 1 RTSP session, retries RTSP 453, in-memory frame cache) + rtsp_priority() (clip playback pauses grabs)
-  recordings.py             # motion event log + clip video: list_events (CMSearch POST /ISAPI/ContentMgmt/search on the motion track) + clip_process (RTSP playback -> ffmpeg fragmented MP4, audio dropped)
-  scan.py                   # rtsp-scan: windowed probe (window of --parallel IPs, port-major) + ONE shared budget of `workers` slots for probe+verify combined (a found port hands its slot from probing to verifying; total in-flight <= workers) — scan_and_verify + probe_rtsp + find_credential(_ex) + enumerate_streams (vendor+channel enumeration + credential/attempts/reason) + probe_streams (streams-only wrapper) + expand_range/expand_ranges + rtsp_link + device_entry
-  vendors/                  # one module per camera/DVR family (Vendor: realm keywords + per-stream path groups + channel walk w/ early-stop). __init__.detect(realm)/enumeration_order(); add a device here, not in scan.py
-  default_config.json       # USER-OWNED runtime input (devices=[], scan range/ports). Assistant: never read/edit. config.py reads it at runtime only.
-  web.py                    # loads static/index.html + static/app.js
-  server.py                 # BaseHTTPRequestHandler routes + ThreadingHTTPServer + run_gui()
-  cli.py                    # argparse: GUI (default), `discover`, `rtsp-scan`, `import`
-  __main__.py               # `python3 -m cameraviewer`
-  static/index.html         # markup + CSS (frontend)
-  static/app.js             # all frontend JS
-tests/                      # unittest; helpers.py has the fake camera transport + FakeProc
+ivms666.py                # thin launcher -> cli.main()
+config.py                 # device store + JSON persistence (~/.ivms666.json, 0600); unified device model (is_isapi/is_rtsp, _parse_rtsp_url -> host/rtsp_port/user/password/path, agentgreen_port); named groups (list/create/delete_group); app settings (save_path, motion_popup); device-file import/export
+camera.py                 # ISAPI HTTP (get/put/open_stream), snapshot, MAX_STILL_RES, channel discovery, safe XML parse
+motion.py                 # gridMap codec + get_motion / set_motion (read-modify-write)  [detection AREA editor]
+events.py                 # motion ALERT stream: per-device daemon watches /ISAPI/Event/notification/alertStream, tracks per-channel VMD state (hold window) for the live badge/popup (skips kind=rtsp). get_state / start_all / ensure / stop
+store.py                  # server-side snapshot saving to config save_path (save_snapshot = ISAPI still; save_bytes = pre-grabbed bytes, used for RTSP)
+diagnose.py               # per-device health check + safe auto-fix. Live channels: motion enabled/area, VMD email+center linkage, motion-rec 10s pre/post, max-res. Unused channels (NO VIDEO input or hidden tile): only "recording left on" -> disable track. Device-wide: SMTP + DVR clock (System/time) skew -> set correct local time
+live.py                   # RTSP->MJPEG via ffmpeg (Live view); rtsp_url (stored URL for kind=rtsp) + check + open_mjpeg + grab_still (one frame, for RTSP tiles/Save); -timeout so dead streams fail fast; SAR->square-pixel so streams aren't squished
+playback.py               # recorded playback: one still at a chosen time via RTSP tracks + ffmpeg; to_span + playback_url + grab_frame (serialized to 1 RTSP session, retries RTSP 453, in-memory frame cache) + rtsp_priority() (clip playback pauses grabs)
+recordings.py             # motion event log + clip video: list_events (CMSearch POST /ISAPI/ContentMgmt/search on the motion track) + clip_process (RTSP playback -> ffmpeg fragmented MP4, audio dropped)
+scan.py                   # rtsp-scan: windowed probe (window of --parallel IPs, port-major) + ONE shared budget of `workers` slots for probe+verify combined (a found port hands its slot from probing to verifying; total in-flight <= workers) — scan_and_verify + probe_rtsp + find_credential(_ex) + enumerate_streams (vendor+channel enumeration + credential/attempts/reason) + probe_streams (streams-only wrapper) + expand_range/expand_ranges + rtsp_link + device_entry
+vendors/                  # one module per camera/DVR family (Vendor: realm keywords + per-stream path groups + channel walk w/ early-stop). __init__.detect(realm)/enumeration_order(); add a device here, not in scan.py
+default_config.json       # USER-OWNED runtime input (devices=[], scan range/ports). Assistant: never read/edit. config.py reads it at runtime only.
+web.py                    # loads static/index.html + static/app.js
+server.py                 # BaseHTTPRequestHandler routes + ThreadingHTTPServer + run_gui()
+cli.py                    # argparse: GUI (default), `discover`, `rtsp-scan`, `import`
+static/index.html         # markup + CSS (frontend)
+static/app.js             # all frontend JS
+tests/                    # unittest; helpers.py has the fake camera transport + FakeProc
 ```
 
 Layering rule: `config` and `camera` are leaves. `motion` depends on `camera`.
@@ -480,8 +481,8 @@ Layering rule: `config` and `camera` are leaves. `motion` depends on `camera`.
 `cli` depends on `server`/`camera`. Don't create cycles.
 
 **Cross-module calls go through the module, not the name** — e.g. `motion.py`
-calls `camera.camera_get(...)` (via `from . import camera`), never
-`from .camera import camera_get`. This is deliberate: tests fake the network by
+calls `camera.camera_get(...)` (via `import camera`), never
+`from camera import camera_get`. This is deliberate: tests fake the network by
 patching `camera.camera_get` / `camera_put`, and that only works if callers look
 the name up on the module at call time. Preserve this pattern.
 
@@ -558,6 +559,40 @@ python3 -m unittest discover -s tests -t .
   end-to-end `test_server` case if it adds/changes a route.
 - Manual device check when needed: `discover` subcommand, or the codec sanity
   checks. Be cautious running `set_motion` against the real DVR — it writes.
+- Any fixture that repoints `config.CONFIG_PATH` **must also repoint
+  `config.LEGACY_CONFIG_PATH`** (see below) — otherwise `config.load()` copies the
+  developer's real `~/.camera_viewer.json`, credentials and all, into the temp dir.
+
+## Deployment (`ivms666.sadensmol.com`)
+
+Public step-by-step lives in [README.md](README.md) → *Deployment*. What matters
+when editing code:
+
+- **The app has no authentication of its own, and gains none by being deployed.**
+  The only gate is **Cloudflare Access** (self-hosted app on the hostname, e-mail
+  one-time PIN). It cannot be bypassed **only because the droplet exposes no
+  inbound web port**: `cloudflared` dials out, and the app container publishes no
+  host port (`docker-compose.yml`). **Never add a `ports:` mapping to the `app`
+  service** — that single line would put unauthenticated camera feeds on the
+  public internet.
+- **Nothing runs as a package.** `Dockerfile` does `COPY . .` and
+  `CMD python3 ivms666.py`; `.dockerignore` keeps tests/docs/secrets out.
+- **`HOME=/data`** in the image, with a named volume mounted there, is what makes
+  `CONFIG_PATH` (`~/.ivms666.json`, 0600) and `DEFAULT_SAVE_PATH` (`~/ivms666`)
+  persist. Both stay `~`-relative for exactly this reason — don't hardcode them.
+- **`CV_LISTEN_HOST` / `CV_LISTEN_PORT` / `CV_NO_BROWSER`** are the only runtime
+  env knobs. Defaults stay loopback + browser-opening so a local run is unchanged;
+  the image overrides all three.
+- **`LEGACY_CONFIG_PATH`** (`~/.camera_viewer.json`) is adopted once by
+  `config._migrate_legacy()` on `load()` — copy, not move, and only when the new
+  path doesn't exist, so it can never clobber live config.
+- CI (`.github/workflows/deploy.yml`): tests → build+push GHCR (public repo →
+  public package → the droplet pulls anonymously) → scp `docker-compose.yml` +
+  `docker compose pull && up -d` over SSH. Secrets are only `DROPLET_HOST` /
+  `DROPLET_USER` / `DROPLET_SSH_KEY`; the Cloudflare `TUNNEL_TOKEN` lives solely in
+  `/opt/ivms666/.env` on the droplet and must never move into GitHub.
+- **The DVR must be internet-reachable** from the droplet, and its ~one-concurrent
+  -RTSP-session cap is now shared with anyone watching from home (expect 453s).
 
 ## Device gotchas / hard-won facts (running log — append as you learn)
 

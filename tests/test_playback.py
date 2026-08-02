@@ -6,7 +6,7 @@ import time
 import unittest
 from unittest import mock
 
-from cameraviewer import playback
+import playback
 
 JPEG = b"\xff\xd8jpeg\xff\xd9"
 BW_ERR = "[rtsp @ 0x1] method DESCRIBE failed: 453Not Enough Bandwidth"

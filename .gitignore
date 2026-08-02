@@ -19,7 +19,14 @@ env/
 # but never commit it if it ends up in the repo (or CONFIG_PATH is changed).
 .camera_viewer.json
 camera_viewer.json
+.ivms666.json
+ivms666.json
 *.tmp
+
+# Cloudflare tunnel token / any deploy secrets. The real one lives only on the
+# droplet at /opt/ivms666/.env — never in the repo — but ignore it defensively.
+.env
+*.env
 
 # Editor / OS
 .DS_Store

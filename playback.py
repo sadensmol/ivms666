@@ -19,7 +19,7 @@ import time
 from datetime import datetime, timedelta
 from urllib.parse import quote
 
-from . import live  # reuse ffmpeg_available / rtsp_port
+import live  # reuse ffmpeg_available / rtsp_port
 
 # This OEM DVR caps concurrent RTSP sessions HARD — a second/third simultaneous
 # playback grab (or one opened while a stale session lingers) gets

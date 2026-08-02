@@ -13,7 +13,7 @@ never touched. The write is gated by a round-trip self-check.
 
 import re
 
-from . import camera
+import camera
 
 GRID_MSB_FIRST = True
 

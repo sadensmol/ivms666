@@ -3,7 +3,7 @@
 import io
 import unittest
 
-from cameraviewer import live
+import live
 
 
 class _CapturePopen:

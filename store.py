@@ -12,7 +12,7 @@ import os
 import re
 import time
 
-from . import camera, config
+import camera, config
 
 
 def _stamp():

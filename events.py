@@ -23,7 +23,7 @@ import threading
 import time
 import urllib.error
 
-from . import camera, config
+import camera, config
 
 ALERT_PATH = "/ISAPI/Event/notification/alertStream"
 HOLD_SECONDS = 6.0      # a channel stays "active" this long after its last active event

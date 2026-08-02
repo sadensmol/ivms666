@@ -1,5 +1,7 @@
 """End-to-end HTTP tests through the real request handler (camera layer faked)."""
 
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -8,7 +10,7 @@ import unittest
 import urllib.error
 import urllib.request
 
-from cameraviewer import camera, config, events, live, playback, recordings, server
+import camera, config, events, live, playback, recordings, server
 from tests.helpers import (
     FakeCamera, FakeProc, FAKE_JPEG, OK_RESP, all_on_gridmap, cmsearch_result_xml,
     motion_xml, record_track_xml, stream_caps_xml, stream_channel_xml, time_xml,
@@ -66,7 +68,10 @@ class ServerTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self._orig_path = config.CONFIG_PATH
+        self._orig_legacy = config.LEGACY_CONFIG_PATH
         config.CONFIG_PATH = os.path.join(self.tmp, "cfg.json")
+        # keep the pre-rename migration away from the real ~/.camera_viewer.json
+        config.LEGACY_CONFIG_PATH = os.path.join(self.tmp, "legacy.json")
         self.save_dir = os.path.join(self.tmp, "shots")
         config._state = {"devices": [], "settings": {"save_path": self.save_dir}}
 
@@ -88,6 +93,7 @@ class ServerTest(unittest.TestCase):
         camera.open_stream = self._orig_open_stream
         self.fake.__exit__()
         config.CONFIG_PATH = self._orig_path
+        config.LEGACY_CONFIG_PATH = self._orig_legacy
         config._state = {"devices": []}
 
     def req(self, method, path, body=None):
@@ -112,7 +118,7 @@ class ServerTest(unittest.TestCase):
     def test_index_and_appjs_served(self):
         st, b = self.req("GET", "/")
         self.assertEqual(st, 200)
-        self.assertIn(b"Camera Viewer", b)
+        self.assertIn(b"ivms666", b)
         st, b = self.req("GET", "/app.js")
         self.assertEqual(st, 200)
         self.assertIn(b"loadDevices", b)
@@ -457,6 +463,38 @@ class ServerTest(unittest.TestCase):
             self.assertIn(b"ffmpeg", b)
         finally:
             live.ffmpeg_available = orig
+
+
+class RunGuiTest(unittest.TestCase):
+    """A detached container has no display: CV_NO_BROWSER must suppress the
+    browser launch, and only that — the server still comes up either way."""
+
+    def _run(self, env_value):
+        opened = []
+        stub = type("Stub", (), {"serve_forever": lambda self: None,
+                                 "shutdown": lambda self: None})
+        orig = (server.Server, server.webbrowser.open, config.load, events.start_all)
+        server.Server = lambda addr, handler: stub()
+        server.webbrowser.open = opened.append
+        config.load = lambda: None
+        events.start_all = lambda: None
+        if env_value is None:
+            os.environ.pop("CV_NO_BROWSER", None)
+        else:
+            os.environ["CV_NO_BROWSER"] = env_value
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):   # keep the banner out of test output
+                server.run_gui()
+        finally:
+            server.Server, server.webbrowser.open, config.load, events.start_all = orig
+            os.environ.pop("CV_NO_BROWSER", None)
+        return opened
+
+    def test_browser_opens_by_default(self):
+        self.assertEqual(len(self._run(None)), 1)
+
+    def test_no_browser_env_suppresses_launch(self):
+        self.assertEqual(self._run("1"), [])
 
 
 if __name__ == "__main__":

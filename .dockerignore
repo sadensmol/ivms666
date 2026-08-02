@@ -1,0 +1,25 @@
+.git
+.github
+.claude
+docs
+tests
+README.md
+CLAUDE.md
+Dockerfile
+docker-compose.yml
+.dockerignore
+.gitignore
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Never bake credentials or scan results into a published image.
+*camera_viewer.json
+*ivms666.json
+rtsp-scan-output.json
+.env
+*.env
+*.tmp
+.DS_Store

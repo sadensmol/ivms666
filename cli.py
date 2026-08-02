@@ -5,8 +5,8 @@ import shutil
 import sys
 import threading
 
-from . import camera, config, scan
-from .server import run_gui
+import camera, config, scan
+from server import run_gui
 
 
 def run_discover(ns):
@@ -208,7 +208,7 @@ def run_rtsp_scan(ns):
     print(f"{ns.output} now holds {len(merged)} stream(s) (new appended, existing kept):")
     for i, e in enumerate(merged, 1):
         print(f"  {i}. {config.strip_url_creds(e.get('rtsp_url', '') or e.get('host', ''))}")
-    print(f"\nImport into the app:  python3 -m cameraviewer import --file {ns.output}")
+    print(f"\nImport into the app:  python3 ivms666.py import --file {ns.output}")
     return 0
 
 

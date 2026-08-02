@@ -10,7 +10,7 @@ import threading
 import time
 import unittest
 
-from cameraviewer import scan, vendors
+import scan, vendors
 
 NONCE = "deadbeefcafe0001"
 

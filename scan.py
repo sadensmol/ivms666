@@ -18,7 +18,7 @@ import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from . import live, vendors
+import live, vendors
 
 STD_PORT = 554
 MAX_CHANNELS = 8   # DVRs are usually 4/8/16-ch; probe channels 1..this per found port
@@ -34,7 +34,7 @@ def probe_rtsp(host, port, timeout=5):
     req = (
         f"OPTIONS rtsp://{host}:{port}/ RTSP/1.0\r\n"
         "CSeq: 1\r\n"
-        "User-Agent: cameraviewer\r\n\r\n"
+        "User-Agent: ivms666\r\n\r\n"
     ).encode()
     s = socket.socket()
     s.settimeout(timeout)
@@ -246,7 +246,7 @@ def rtsp_describe(host, port, user, password, path="/Streaming/Channels/101", ti
 
     def _send(sock, cseq, auth=None):
         lines = [f"DESCRIBE {url} RTSP/1.0", f"CSeq: {cseq}",
-                 "User-Agent: cameraviewer", "Accept: application/sdp"]
+                 "User-Agent: ivms666", "Accept: application/sdp"]
         if auth:
             lines.append(f"Authorization: {auth}")
         sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())

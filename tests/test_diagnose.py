@@ -4,7 +4,7 @@ import re
 import unittest
 import urllib.error
 
-from cameraviewer import camera, diagnose
+import camera, diagnose
 from tests.helpers import (
     FakeCamera, OK_RESP, all_on_gridmap, motion_xml, record_track_xml,
     stream_caps_xml, stream_channel_xml, time_xml, video_inputs_xml)

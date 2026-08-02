@@ -25,6 +25,7 @@ Routes:
 
 import http.server
 import json
+import os
 import socketserver
 import threading
 import urllib.error
@@ -32,7 +33,7 @@ import webbrowser
 from datetime import datetime, timedelta
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import camera, config, diagnose, events, live, motion, playback, recordings, store, web
+import camera, config, diagnose, events, live, motion, playback, recordings, store, web
 
 _LIVE_FIRST_READ = 512   # bytes to wait for before declaring the stream alive
 _LIVE_CHUNK = 8192
@@ -533,13 +534,16 @@ def run_gui():
     events.start_all()  # begin watching every device for motion (works headless)
     url = f"http://{config.LISTEN_HOST}:{config.LISTEN_PORT}/"
     server = Server((config.LISTEN_HOST, config.LISTEN_PORT), Handler)
-    print(f"Camera Viewer running at {url}")
+    print(f"ivms666 running at {url}")
     print(f"Devices stored in {config.CONFIG_PATH}")
     print("Press Ctrl+C to stop.")
-    try:
-        webbrowser.open(url)
-    except Exception:
-        pass
+    # A detached container has no browser and no display; opening one there would
+    # spawn junk processes for nobody. CV_NO_BROWSER is set in the image.
+    if not os.environ.get("CV_NO_BROWSER"):
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
     try:
         server.serve_forever()
     except KeyboardInterrupt:

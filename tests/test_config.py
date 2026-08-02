@@ -1,23 +1,28 @@
 """Device store: CRUD, password masking, and persistence."""
 
+import importlib
 import json
 import os
 import stat
 import tempfile
 import unittest
 
-from cameraviewer import config
+import config
 
 
 class ConfigTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self._orig_path = config.CONFIG_PATH
+        self._orig_legacy = config.LEGACY_CONFIG_PATH
         config.CONFIG_PATH = os.path.join(self.tmp, "cfg.json")
+        # keep the pre-rename migration away from the real ~/.camera_viewer.json
+        config.LEGACY_CONFIG_PATH = os.path.join(self.tmp, "legacy.json")
         config._state = {"devices": []}
 
     def tearDown(self):
         config.CONFIG_PATH = self._orig_path
+        config.LEGACY_CONFIG_PATH = self._orig_legacy
         config._state = {"devices": []}
 
     def _add(self, **kw):
@@ -317,6 +322,51 @@ class ConfigTest(unittest.TestCase):
         config._state = {"devices": []}
         config.load()
         self.assertEqual(config.get_cfg(d["id"])["host"], "9.9.9.9")
+
+    def test_legacy_config_is_migrated_once_and_never_clobbers(self):
+        # a pre-rename ~/.camera_viewer.json is adopted on first load, 0600
+        with open(config.LEGACY_CONFIG_PATH, "w") as f:
+            json.dump({"devices": [{"id": "old", "host": "5.5.5.5", "password": "p"}]}, f)
+        config.load()
+        self.assertEqual(config.get_cfg("old")["host"], "5.5.5.5")
+        self.assertEqual(stat.S_IMODE(os.stat(config.CONFIG_PATH).st_mode), 0o600)
+        self.assertTrue(os.path.exists(config.LEGACY_CONFIG_PATH))   # copied, not moved
+
+        # an existing new-path config always wins — migration must not overwrite it
+        config._state = {"devices": []}
+        self._add(host="7.7.7.7")
+        config._state = {"devices": []}
+        config.load()
+        self.assertEqual([d["host"] for d in config.list_devices()], ["7.7.7.7"])
+
+
+class ListenAddressTest(unittest.TestCase):
+    """The bind address is env-driven so the same code runs on loopback locally
+    and on 0.0.0.0 inside the container. The default must stay loopback."""
+
+    def tearDown(self):
+        for var in ("CV_LISTEN_HOST", "CV_LISTEN_PORT"):
+            os.environ.pop(var, None)
+        importlib.reload(config)   # restore the defaults for every other test
+
+    def test_env_port_falls_back_on_junk(self):
+        self.assertEqual(config._env_port("CV_NOPE", 8777), 8777)
+        os.environ["CV_LISTEN_PORT"] = "9001"
+        self.assertEqual(config._env_port("CV_LISTEN_PORT", 8777), 9001)
+        os.environ["CV_LISTEN_PORT"] = "not-a-port"
+        self.assertEqual(config._env_port("CV_LISTEN_PORT", 8777), 8777)
+
+    def test_defaults_are_loopback(self):
+        importlib.reload(config)
+        self.assertEqual(config.LISTEN_HOST, "127.0.0.1")
+        self.assertEqual(config.LISTEN_PORT, 8777)
+
+    def test_env_overrides_bind(self):
+        os.environ["CV_LISTEN_HOST"] = "0.0.0.0"
+        os.environ["CV_LISTEN_PORT"] = "9999"
+        importlib.reload(config)
+        self.assertEqual(config.LISTEN_HOST, "0.0.0.0")
+        self.assertEqual(config.LISTEN_PORT, 9999)
 
 
 if __name__ == "__main__":

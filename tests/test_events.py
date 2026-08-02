@@ -7,7 +7,7 @@ bytes and control the clock via events._now.
 import unittest
 import urllib.error
 
-from cameraviewer import config, events
+import config, events
 
 
 def alert(ch, etype="VMD", state="active"):

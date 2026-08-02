@@ -7,7 +7,7 @@ import os
 import unittest
 from unittest import mock
 
-from cameraviewer import cli
+import cli
 
 
 def _fit(lines, cols, rows):
