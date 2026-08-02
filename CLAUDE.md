@@ -327,7 +327,10 @@ or does not expose the feature at all.
   (`/clip?…&download=1` → `Content-Disposition: attachment`) — it is `-c:v copy`,
   so the download IS the recording's own resolution, nothing is re-encoded. `🔗`
   copies a **share link** (`/watch?device=&ch=&start=&end=`, `shareClip`) that opens
-  `static/watch.html`, a standalone page playing just that clip. **The link carries
+  `static/watch.html`, a standalone page **auto-playing** just that clip. It
+  autoplays **muted** (`<video autoplay muted playsinline>` + an explicit
+  `v.play()` on `loadeddata`) — browsers block un-muted autoplay, and the clip is
+  audio-less anyway (`-an`), so nothing is lost. **The link carries
   no credentials** — only the device id + track + span; the server resolves the
   camera from `~/.ivms666.json` when the page requests `/clip`. It is not an
   authentication bypass either: the app has none of its own, so whoever opens it

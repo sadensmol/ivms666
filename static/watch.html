@@ -28,7 +28,9 @@
   <button id="dl">⬇ Download</button>
   <a class="btn secondary" href="/">Open ivms666</a>
 </header>
-<div class="stage"><video id="v" controls autoplay playsinline></video></div>
+<!-- muted so browsers allow autoplay (mobile blocks unmuted autoplay); the clip is
+     audio-less anyway (`-an`), so nothing is lost. -->
+<div class="stage"><video id="v" controls autoplay muted playsinline></video></div>
 <div class="msg" id="msg">Loading the clip from the DVR…</div>
 <script>
 // A shared link carries only device id + track + time span — never credentials; the
@@ -52,7 +54,9 @@ if (!device || !start || !end) {
 } else {
   document.getElementById('when').textContent = pretty(start);
   v.src = clipUrl(false);
-  v.onloadeddata = () => { msg.textContent = ''; };
+  // Autoplay: the `autoplay` attribute alone is unreliable, so kick it off explicitly
+  // once data arrives (muted, so the browser won't block it).
+  v.onloadeddata = () => { msg.textContent = ''; v.play().catch(() => {}); };
   v.onerror = () => { msg.textContent = '⚠ could not play — the DVR may be busy (it serves one stream at a time) or the recording is gone.'; msg.className = 'msg err'; };
   document.getElementById('dl').onclick = () => { location.href = clipUrl(true); };
   fetch('/watch/info?device=' + encodeURIComponent(device) + '&ch=' + encodeURIComponent(ch))
