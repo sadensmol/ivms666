@@ -8,10 +8,14 @@ natively. ffmpeg is an external binary (the one non-stdlib dependency, used only
 while a Live window is open).
 """
 
+import atexit
+import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
+import threading
 from urllib.parse import quote
 
 # ffmpeg's mpjpeg muxer frames each JPEG with a `--ffmpeg` boundary.
@@ -103,12 +107,14 @@ def grab_still(url, width=None, timeout=15):
     cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-rtsp_transport", "tcp",
            "-timeout", RTSP_TIMEOUT_US, "-i", url, "-frames:v", "1", "-q:v", "4",
            "-vf", vf, "-f", "mjpeg", "-"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = spawn(cmd)
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
         out, err = proc.communicate()
+    finally:
+        terminate(proc)   # reaped either way, and never left in the registry
     return out, (err or b"").decode("utf-8", "replace")
 
 
@@ -140,7 +146,7 @@ def open_mjpeg(url, fps=15, quality=5):
         "-vf", _SQUARE_PIXELS,       # correct aspect (SAR) so the stream isn't squished
         "-f", "mpjpeg", "-",
     ]
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return spawn(cmd)
 
 
 def open_audio(url):
@@ -158,11 +164,31 @@ def open_audio(url):
         "-flush_packets", "1",       # low-latency streaming
         "-f", "mp3", "-",
     ]
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return spawn(cmd)
+
+
+# Every ffmpeg we spawn is registered here so it can be killed when the server
+# exits. This is NOT bookkeeping for its own sake: the DVR serves ~ONE RTSP
+# session, and an ffmpeg that outlives its parent keeps that session ESTABLISHED
+# forever — after which every playback grab returns `453 Not Enough Bandwidth`
+# and the whole event log shows broken thumbnails (see CLAUDE.md gotchas).
+_procs = set()
+_procs_lock = threading.Lock()
+
+
+def spawn(cmd):
+    """Popen an ffmpeg command with piped stdout/stderr and remember the child, so
+    `terminate_all()` can kill it on shutdown. Use this instead of Popen directly."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    with _procs_lock:
+        _procs.add(proc)
+    return proc
 
 
 def terminate(proc):
     """Kill an ffmpeg process and reap it, ignoring the usual teardown errors."""
+    with _procs_lock:
+        _procs.discard(proc)
     try:
         proc.kill()
     except Exception:
@@ -177,3 +203,56 @@ def terminate(proc):
         proc.wait(timeout=3)
     except Exception:
         pass
+
+
+def terminate_all():
+    """Kill every ffmpeg still running. Registered with atexit (and called from the
+    server's SIGTERM path) so a stop/restart never strands an RTSP session."""
+    with _procs_lock:
+        procs = list(_procs)
+    for proc in procs:
+        terminate(proc)
+
+
+atexit.register(terminate_all)
+
+
+def _orphan_pids(ps_output, hosts):
+    """PIDs of ORPHANED ffmpeg processes (parent already gone) streaming from one
+    of `hosts` — i.e. children stranded by a previous run that was SIGKILLed, which
+    atexit could not clean up. Input is `ps -Ao pid=,ppid=,command=` output. Matching
+    is deliberately narrow (ffmpeg + rtsp:// + one of OUR device hosts) so we never
+    kill an unrelated process."""
+    pids = []
+    for line in ps_output.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, ppid, cmd = parts
+        if ppid != "1" or "ffmpeg" not in cmd or "rtsp://" not in cmd:
+            continue
+        if not any(h and h in cmd for h in hosts):
+            continue
+        try:
+            pids.append(int(pid))
+        except ValueError:
+            pass
+    return pids
+
+
+def kill_orphans(hosts):
+    """Reclaim the DVR's RTSP session at startup: kill ffmpeg children stranded by a
+    previous run (see `_orphan_pids`). Returns the pids killed."""
+    try:
+        out = subprocess.run(["ps", "-Ao", "pid=,ppid=,command="],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:  # noqa: BLE001 - ps missing/blocked: nothing to reclaim
+        return []
+    killed = []
+    for pid in _orphan_pids(out, hosts):
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed.append(pid)
+        except OSError:
+            pass
+    return killed

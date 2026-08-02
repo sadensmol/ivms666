@@ -38,6 +38,30 @@ class PlaybackTest(unittest.TestCase):
         self.assertIn("rtsp://h:554/Streaming/tracks/201/", u)  # no creds, default port
 
 
+class RunFfmpegTest(unittest.TestCase):
+    """The grab command itself — every thumbnail in the event log waits behind it,
+    so the latency flags are part of the contract, as is not stranding the child."""
+
+    def _cmd_for(self, **kw):
+        proc = mock.Mock(**{"communicate.return_value": (JPEG, b"")})
+        with mock.patch.object(playback.live, "spawn", return_value=proc) as spawn, \
+             mock.patch.object(playback.live, "terminate") as term:
+            playback._run_ffmpeg("rtsp://x/1", 25, kw.get("width"))
+        term.assert_called_once_with(proc)   # child always reaped -> no stranded RTSP session
+        return spawn.call_args[0][0]
+
+    def test_skips_audio_and_caps_stream_analysis(self):
+        cmd = self._cmd_for()
+        self.assertIn("-an", cmd)              # no G.711 audio setup for a single still
+        self.assertIn("-probesize", cmd)       # don't spend the default 5MB/5s analysing
+        self.assertIn("-analyzeduration", cmd)
+        self.assertIn("-timeout", cmd)         # a stalled RTSP dies instead of hanging forever
+
+    def test_width_scales_the_frame(self):
+        cmd = self._cmd_for(width=480)
+        self.assertEqual(cmd[cmd.index("-vf") + 1], "scale=480:-2")
+
+
 class GrabFrameTest(unittest.TestCase):
     def setUp(self):
         # isolate each test from the module-level frame cache

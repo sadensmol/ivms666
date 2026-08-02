@@ -105,17 +105,28 @@ def playback_url(cfg, track_id, start, end):
 
 def _run_ffmpeg(url, timeout, width):
     """One ffmpeg attempt: decode a single JPEG frame. Returns (bytes, stderr)."""
-    cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-rtsp_transport", "tcp", "-i", url,
-           "-frames:v", "1", "-q:v", "4"]
+    # Latency matters more than anything here: the DVR serves ONE playback session,
+    # so every thumbnail in the event log waits behind this one grab.
+    #   -an                      don't set up / analyse the G.711 audio track at all
+    #   -probesize/-analyzeduration  stop stream analysis early (defaults are 5MB/5s
+    #                            of input — pure dead time for one known H.264 track)
+    cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-rtsp_transport", "tcp",
+           "-timeout", live.RTSP_TIMEOUT_US,
+           "-probesize", "200000", "-analyzeduration", "500000",
+           "-i", url, "-an", "-frames:v", "1", "-q:v", "4"]
     if width:
         cmd += ["-vf", f"scale={int(width)}:-2"]
     cmd += ["-f", "mjpeg", "-"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = live.spawn(cmd)
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
         out, err = proc.communicate()
+    finally:
+        # Never leave this child behind: a stranded ffmpeg holds the DVR's single
+        # RTSP session and every later grab then fails with 453.
+        live.terminate(proc)
     return out, (err or b"").decode("utf-8", "replace")
 
 

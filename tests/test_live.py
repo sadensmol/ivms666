@@ -1,4 +1,4 @@
-"""RTSP URL building and live-view pre-flight checks."""
+"""RTSP URL building, live-view pre-flight checks and ffmpeg child bookkeeping."""
 
 import io
 import unittest
@@ -14,9 +14,16 @@ class _CapturePopen:
         _CapturePopen.last_cmd = cmd
         self.stdout = io.BytesIO(b"\xff\xd8jpeg\xff\xd9")
         self.stderr = io.BytesIO(b"")
+        self.killed = False
 
     def communicate(self, timeout=None):
         return self.stdout.read(), b""
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        return 0
 
 
 class AspectRatioTest(unittest.TestCase):
@@ -98,6 +105,51 @@ class RtspUrlTest(unittest.TestCase):
         self.assertEqual(
             live._host_port({"kind": "rtsp", "rtsp_url": "rtsp://cam.local/live"}),
             ("cam.local", 554))
+
+
+class ChildProcessTest(unittest.TestCase):
+    """Every ffmpeg we spawn must be killable on shutdown: one left behind keeps
+    its RTSP session open and the DVR then answers 453 to every later grab."""
+
+    def setUp(self):
+        live._procs.clear()
+
+    def _spawn(self):
+        orig = live.subprocess.Popen
+        live.subprocess.Popen = _CapturePopen
+        try:
+            return live.spawn(["ffmpeg", "-i", "rtsp://x/1"])
+        finally:
+            live.subprocess.Popen = orig
+
+    def test_spawn_registers_the_child(self):
+        proc = self._spawn()
+        self.assertIn(proc, live._procs)
+
+    def test_terminate_kills_and_forgets(self):
+        proc = self._spawn()
+        live.terminate(proc)
+        self.assertTrue(proc.killed)
+        self.assertNotIn(proc, live._procs)
+
+    def test_terminate_all_kills_every_child(self):
+        procs = [self._spawn(), self._spawn()]
+        live.terminate_all()
+        self.assertTrue(all(p.killed for p in procs))
+        self.assertFalse(live._procs)
+
+    def test_orphan_pids_finds_only_our_abandoned_streams(self):
+        ps = "\n".join([
+            "  111     1 ffmpeg -i rtsp://u:p@1.2.3.4:8556/Streaming/tracks/101/?starttime=x",
+            "  222   999 ffmpeg -i rtsp://u:p@1.2.3.4:8556/Streaming/Channels/101",  # still ours, has a parent
+            "  333     1 ffmpeg -i rtsp://9.9.9.9/live",       # orphan, but not our device
+            "  444     1 /usr/bin/qemu -display none",         # not ffmpeg
+        ])
+        self.assertEqual(live._orphan_pids(ps, ["1.2.3.4", "5.6.7.8"]), [111])
+
+    def test_orphan_pids_without_hosts_matches_nothing(self):
+        ps = "  111     1 ffmpeg -i rtsp://1.2.3.4/live"
+        self.assertEqual(live._orphan_pids(ps, []), [])
 
 
 class CheckTest(unittest.TestCase):

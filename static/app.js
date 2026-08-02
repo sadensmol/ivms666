@@ -580,18 +580,45 @@ function applyMotion(d, channels) {
    and the live motion-detected snapshot. Close button + Esc + backdrop all work. ---- */
 let motTimer = null;   // 1s image-refresh interval (live motion popup only)
 let motCur = null;     // {deviceId, chId, input, name, dname, host} while showing live motion
+let imgCtx = null;     // {deviceId, chId, time} of a static event frame (for download / live)
 function openImg() { $('imgOverlay').classList.add('open'); }
 function closeImg() {
   if (motTimer) { clearInterval(motTimer); motTimer=null; }
-  motCur = null;
+  motCur = null; imgCtx = null;
   $('imgOverlay').classList.remove('open'); $('imgOverlay').classList.remove('motion');
   $('imgBig').removeAttribute('src');
 }
-function showImage(src, title) {       // static image (event-frame thumbnail)
+function showImage(src, title, ctx) {   // static image (event-frame thumbnail)
   closeImg();
+  imgCtx = ctx || null;                // what ⬇ Download / ▶ Live view act on
   $('imgTitle').textContent = title || 'Image';
   $('imgBig').src = src;
+  $('imgLive').style.display = imgCtx ? '' : 'none';
   openImg();
+}
+// The lightbox shows a downscaled thumbnail (that is all the DVR gave us cheaply);
+// ⬇ Download asks for the SAME instant WITHOUT `res`, i.e. the recording's own
+// resolution — a fresh grab, so it takes the usual few seconds.
+function downloadFromImg() {
+  if (motCur)   // live motion popup -> the current still at the DVR's max
+    return download('/snapshot?device='+encodeURIComponent(motCur.deviceId)+
+                    '&ch='+encodeURIComponent(motCur.chId)+'&res=1280x720&download=1');
+  if (!imgCtx) return;
+  download('/playback?device='+encodeURIComponent(imgCtx.deviceId)+'&ch='+encodeURIComponent(imgCtx.chId)+
+           '&time='+encodeURIComponent(imgCtx.time)+'&download=1');
+}
+function liveFromImg() {
+  const c = motCur ? {deviceId:motCur.deviceId, chId:motCur.chId} : imgCtx;
+  if (!c) return;
+  const d = devices.find(x=>x.id===c.deviceId);
+  closeImg();
+  if (d) openLive(d, c.chId);
+}
+// Content-Disposition does the saving; a bare link keeps the page (and its streams) put.
+function download(url) {
+  const a=document.createElement('a');
+  a.href=url; a.download=''; a.style.display='none';
+  document.body.appendChild(a); a.click(); a.remove();
 }
 function showMotionPopup(d, ch) {
   // Don't cover a window that's already showing video (Live view or clip playback);
@@ -599,6 +626,7 @@ function showMotionPopup(d, ch) {
   if ($('liveOverlay').classList.contains('open') || $('vidOverlay').classList.contains('open')) return;
   motCur = { deviceId:d.id, chId:ch.id, input:String(ch.input), name:ch.name, dname:d.name, host:d.host };
   $('imgOverlay').classList.add('motion');   // red accent for the alert
+  $('imgLive').style.display = '';           // jump straight from the alert to Live view
   refreshMotionImg();
   openImg();
   if (motTimer) clearInterval(motTimer);
@@ -613,6 +641,7 @@ function refreshMotionImg() {
 
 /* ---- event log: motion clips from the DVR's recordings ---- */
 const EV = { d:null, ch:null };
+const VID = { start:null, end:null };   // the clip currently in the player (for ⬇ Download)
 async function openEvents(d, id) {
   const ch=(chans[d.id]||[]).find(c=>c.id===id); if(!ch) return;
   EV.d=d; EV.ch=ch;
@@ -637,27 +666,79 @@ function renderEvents(events) {
     return;
   }
   let html='<div class="diagsum">'+events.length+' motion event(s) · thumbnails load from the DVR recording (one at a time, a few seconds each):</div>';
+  thumbQ=[]; thumbBusy=null;   // a re-render invalidates the previous queue
   for (const ev of events) {
     // ONE frame pulled live from the DVR, from just after the ~10s pre-record where
     // the motion actually is. The DVR only allows one RTSP session at a time, so a
     // single lazy thumbnail per event is what loads reliably; click it to enlarge
     // (reuses the already-loaded image — instant, no second grab).
     const t=addSecsIso(ev.time, Math.min(12, Math.round(ev.seconds*0.5)));
-    const thumb='<img class="evthumb" loading="lazy" src="'+dvrFrameUrl(t,'480x270')+'" '+
-             'data-t="'+escapeHtml(t)+'" alt="" onerror="this.classList.add(\'evfail\')">';
+    // `src` is set by the loader, NOT here: the DVR serves ~one RTSP session, so the
+    // browser's usual 6 parallel image requests would queue behind the server's grab
+    // lock and time out (that is what turned most rows into broken images).
+    const thumb='<div class="evthumbs"><img class="evthumb" data-src="'+escapeHtml(dvrFrameUrl(t,'480x270'))+'" '+
+             'data-t="'+escapeHtml(t)+'" alt=""><span class="evwait">…</span></div>';
     html+='<div class="evrow"><div class="evmeta"><span class="evtime">'+escapeHtml(ev.time.replace('T',' '))+'</span>'+
           '<span class="evdur">'+ev.seconds+'s</span></div>'+
-          '<div class="evthumbs">'+thumb+'</div>'+
-          '<button class="iconbtn" data-play="'+escapeHtml(ev.start+'|'+ev.end)+'">▶ Play</button></div>';
+          thumb+
+          '<button class="iconbtn" data-play="'+escapeHtml(ev.start+'|'+ev.end)+'">▶ Play</button>'+
+          '<button class="iconbtn" data-dl="'+escapeHtml(ev.start+'|'+ev.end)+'" '+
+          'title="Download this clip (the recording\'s own resolution)">⬇</button>'+
+          '<button class="iconbtn" data-share="'+escapeHtml(ev.start+'|'+ev.end)+'" '+
+          'title="Copy a link that plays this recording (no credentials in the link)">🔗</button></div>';
   }
   $('evBody').innerHTML=html;
   $('evBody').querySelectorAll('[data-play]').forEach(b=>b.onclick=()=>{ const [s,e]=b.dataset.play.split('|'); playClip(s,e); });
+  $('evBody').querySelectorAll('[data-dl]').forEach(b=>b.onclick=()=>{ const [s,e]=b.dataset.dl.split('|'); downloadClip(s,e); });
+  $('evBody').querySelectorAll('[data-share]').forEach(b=>b.onclick=()=>{ const [s,e]=b.dataset.share.split('|'); shareClip(b,s,e); });
   // click a thumbnail -> enlarge the SAME already-loaded image (instant, cached in
   // the browser). A broken/never-loaded thumbnail has nothing to show, so skip it.
-  $('evBody').querySelectorAll('.evthumb').forEach(img=>img.onclick=()=>{
-    if (!img.complete || !img.naturalWidth) return;   // not loaded yet -> nothing cached
-    showImage(img.currentSrc||img.src, 'Event frame · '+img.dataset.t.replace('T',' '));
+  $('evBody').querySelectorAll('.evthumb').forEach(img=>{
+    img.onclick=()=>{
+      if (!img.complete || !img.naturalWidth) return;   // not loaded yet -> nothing cached
+      showImage(img.currentSrc||img.src, 'Event frame · '+img.dataset.t.replace('T',' '),
+                {deviceId:EV.d.id, chId:EV.ch.id, time:img.dataset.t});
+    };
+    img.onload=()=>thumbLoaded(img);
+    img.onerror=()=>thumbFailed(img);
+    thumbQ.push(img);
   });
+  pumpThumbs();
+}
+
+/* Thumbnail loader — STRICTLY ONE GRAB AT A TIME, in row order.
+   Each grab opens an RTSP session on the DVR and the DVR serves about one; the
+   server serializes them too, so anything the browser fires in parallel just sits
+   in that queue until it times out. One failure is retried once (a lingering DVR
+   session drains in tens of seconds), then the row shows WHY plus a ⟳ retry —
+   never a bare broken-image icon. */
+let thumbQ=[], thumbBusy=null, thumbPaused=false;
+function pumpThumbs() {
+  if (thumbBusy || thumbPaused) return;
+  const img=thumbQ.shift();
+  if (!img || !img.isConnected) { if (img) pumpThumbs(); return; }
+  thumbBusy=img;
+  setThumbNote(img, '…');
+  const tries=+img.dataset.try||0;
+  img.src=img.dataset.src+(tries?'&r='+tries:'');   // retry = distinct URL, so no cached failure
+}
+function thumbNext(img) { if (thumbBusy===img) { thumbBusy=null; pumpThumbs(); } }
+function thumbLoaded(img) { img.classList.remove('evfail'); setThumbNote(img, ''); thumbNext(img); }
+function thumbFailed(img) {
+  img.removeAttribute('src');
+  img.classList.add('evfail');
+  const tries=(+img.dataset.try||0)+1;
+  img.dataset.try=tries;
+  if (tries<2) { thumbQ.push(img); setThumbNote(img, 'retrying…'); }   // back of the queue: let other rows through
+  else setThumbNote(img, '⚠ no frame — DVR busy or clip gone <button class="linkbtn" data-retry="1">⟳ retry</button>');
+  thumbNext(img);
+}
+function setThumbNote(img, html) {
+  const note=img.parentElement && img.parentElement.querySelector('.evwait');
+  if (!note) return;
+  note.innerHTML=html;
+  const b=note.querySelector('[data-retry]');
+  if (b) b.onclick=()=>{ img.dataset.try=0; thumbQ.unshift(img); setThumbNote(img,'…'); pumpThumbs(); };
 }
 // a still grabbed live from the DVR recording at a given time (DVR wall clock)
 function dvrFrameUrl(timeIso, res) {
@@ -669,13 +750,43 @@ function addSecsIso(iso, secs) {
   const p=x=>String(x).padStart(2,'0');
   return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
 }
+function clipUrl(start, end, dl) {
+  return '/clip?device='+encodeURIComponent(EV.d.id)+'&ch='+encodeURIComponent(EV.ch.id)+
+         '&start='+encodeURIComponent(start)+'&end='+encodeURIComponent(end)+(dl?'&download=1':'');
+}
+// The clip is the DVR's own recorded H.264, stream-copied (`-c:v copy`) — downloading
+// it gives the full recorded resolution, not the thumbnail/preview quality.
+function downloadClip(start, end) {
+  pauseThumbs();   // the download owns the DVR's single RTSP session while it runs
+  download(clipUrl(start, end, true));
+  setTimeout(resumeThumbs, 20000);   // the transfer runs in the background; free grabs after it
+}
+/* Share = a link to /watch that plays this one recording. It carries ONLY the
+   device id + track + time span — never a username, password or RTSP URL; the
+   server resolves the camera from ~/.ivms666.json when the page asks for the clip.
+   Whoever opens it still has to pass Cloudflare Access first (that is the app's
+   only authentication — see CLAUDE.md → Deployment). */
+function shareUrl(start, end) {
+  return location.origin+'/watch?device='+encodeURIComponent(EV.d.id)+'&ch='+encodeURIComponent(EV.ch.id)+
+         '&start='+encodeURIComponent(start)+'&end='+encodeURIComponent(end);
+}
+async function shareClip(btn, start, end) {
+  const url=shareUrl(start, end);
+  const done=t=>{ const old=btn.textContent; btn.textContent=t; setTimeout(()=>btn.textContent=old, 1800); };
+  try {
+    await navigator.clipboard.writeText(url);   // needs https / localhost
+    done('copied ✓');
+  } catch (e) {
+    window.prompt('Copy this link:', url);      // clipboard blocked -> let the user copy it
+  }
+}
 function playClip(start, end) {
   const v=$('vidPlayer');
   pauseThumbs();   // give the clip the DVR's single RTSP session (stop thumbnail grabs)
+  VID.start=start; VID.end=end;
   $('vidTitle').textContent='Playback — '+(EV.d.name||EV.d.host)+' / '+EV.ch.name;
   $('vidMsg').textContent='Loading… (transcoding the clip from the DVR)';
-  v.src='/clip?device='+encodeURIComponent(EV.d.id)+'&ch='+encodeURIComponent(EV.ch.id)+
-        '&start='+encodeURIComponent(start)+'&end='+encodeURIComponent(end);
+  v.src=clipUrl(start, end);
   v.playbackRate=parseFloat($('vidSpeed').value)||1;
   $('vidOverlay').classList.add('open');
   v.onloadeddata=()=>{ $('vidMsg').textContent=''; v.playbackRate=parseFloat($('vidSpeed').value)||1; v.play().catch(()=>{}); };
@@ -686,19 +797,24 @@ function closeVid() {
   $('vidOverlay').classList.remove('open');
   resumeThumbs();  // clip done -> let the event-log thumbnails finish loading
 }
-// While a clip plays it owns the DVR's one RTSP session, so pause any thumbnail
-// that hasn't loaded yet (stash its src) and resume them when the clip closes.
+// While a clip plays it owns the DVR's one RTSP session: stop the loader and put
+// the in-flight thumbnail back at the FRONT of the queue, so it resumes first when
+// the clip closes.
 function pauseThumbs() {
-  document.querySelectorAll('.evthumb').forEach(img=>{
-    if (img.complete && img.naturalWidth) return;   // already loaded -> keep showing it
-    if (img.getAttribute('src')) { img.dataset.psrc=img.getAttribute('src'); img.removeAttribute('src'); }
-    img.classList.remove('evfail');
-  });
+  thumbPaused=true;
+  if (thumbBusy) {
+    const img=thumbBusy; thumbBusy=null;
+    if (!(img.complete && img.naturalWidth)) {   // already loaded -> keep showing it
+      img.removeAttribute('src');
+      img.classList.remove('evfail');
+      setThumbNote(img, 'paused (clip playing)');
+      thumbQ.unshift(img);
+    }
+  }
 }
 function resumeThumbs() {
-  document.querySelectorAll('.evthumb').forEach(img=>{
-    if (img.dataset.psrc) { img.classList.remove('evfail'); img.src=img.dataset.psrc; delete img.dataset.psrc; }
-  });
+  thumbPaused=false;
+  pumpThumbs();
 }
 
 /* ---- diagnose (motion -> email -> UI pipeline) ---- */
@@ -879,7 +995,7 @@ function saveLiveFrame(){
     const name=(L.d&&(L.d.name||L.d.host))||'camera';
     a.download='live-'+name+'-'+(L.ch?L.ch.id:'')+'-'+new Date().toISOString().replace(/[:.]/g,'-')+'.jpg';
     a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),5000);
-    $('liveMsg').className='hint'; $('liveMsg').textContent='Saved frame.';
+    $('liveMsg').className='hint'; $('liveMsg').textContent='Downloaded frame ('+cv.width+'×'+cv.height+').';
   }, 'image/jpeg', 0.95);
 }
 function closeLive() {
@@ -954,11 +1070,16 @@ $('setSave').onclick=saveSettings;
 $('setMotionPopup').onchange=saveMotionPopup;
 $('diagClose').onclick=()=>$('diagOverlay').classList.remove('open');
 $('diagFix').onclick=fixDiag;
-$('evClose').onclick=()=>$('evOverlay').classList.remove('open');
+// closing the log must also stop the loader — a queue left running keeps opening
+// RTSP sessions on the DVR for thumbnails nobody is looking at
+$('evClose').onclick=()=>{ thumbQ=[]; thumbBusy=null; $('evOverlay').classList.remove('open'); };
 $('evHours').onchange=loadEvents;
 $('vidClose').onclick=closeVid;
+$('vidDownload').onclick=()=>{ if (VID.start) downloadClip(VID.start, VID.end); };
 $('vidSpeed').onchange=()=>{ $('vidPlayer').playbackRate=parseFloat($('vidSpeed').value)||1; };
 $('imgClose').onclick=closeImg;
+$('imgDownload').onclick=downloadFromImg;
+$('imgLive').onclick=liveFromImg;
 $('imgOverlay').onclick=e=>{ if(e.target===$('imgOverlay')) closeImg(); };  // click backdrop to close
 $('devClose').onclick=()=>$('devOverlay').classList.remove('open');
 $('devSave').onclick=saveDevice;
@@ -966,10 +1087,13 @@ $('refresh').onclick=refreshAll;
 $('auto').onchange=syncAuto; $('interval').onchange=syncAuto;
 $('liveClose').onclick=closeLive;
 $('liveSave').onclick=saveLiveFrame;
-// Esc closes the top-most popup (video first, then any open overlay).
+// Esc closes the top-most popup (video, then live, then image, then anything else).
+// Live MUST go through closeLive(): just hiding the overlay would leave the MJPEG
+// <img> streaming, i.e. an ffmpeg holding the DVR's RTSP session.
 window.addEventListener('keydown', e=>{
   if (e.key !== 'Escape') return;
   if ($('vidOverlay').classList.contains('open')) { closeVid(); return; }
+  if ($('liveOverlay').classList.contains('open')) { closeLive(); return; }
   if ($('imgOverlay').classList.contains('open')) { closeImg(); return; }
   const open = document.querySelector('.overlay.open');
   if (open) open.classList.remove('open');

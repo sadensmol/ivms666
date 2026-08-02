@@ -147,6 +147,30 @@ python3 ivms666.py import --file found.json                 # load scan output i
 > (`192.0.0.0/24`) covers the whole block. Network/broadcast addresses are
 > included (`expand_range` uses `ip_interface`, not `.hosts()`).
 
+## EVERY DVR feature is VENDOR-SPECIFIC (only Hikvision/ISAPI is supported)
+
+**Nothing about a DVR is generic.** The event log, motion area, live-motion alert
+stream, diagnose, recorded playback, snapshot resolution, reboot — all of it is a
+**Hikvision-OEM/ISAPI** dialect (endpoint paths, XML schemas, `gridMap` layout,
+`Streaming/tracks/<id>/?starttime=` playback URLs, the 0–6 sensitivity scale, even
+the 453/lockout quirks). Another vendor answers different URLs with different XML,
+or does not expose the feature at all.
+
+- **Supported today: Hikvision ISAPI only.** A device that is not ISAPI is treated
+  as an **RTSP-only stream** (a URL and nothing else) — no event log, motion,
+  diagnose, playback or reboot. Do not "generalise" a Hikvision path into a
+  supposedly universal one; it isn't.
+- **New device families go in `vendors/`, not into the shared modules.** `vendors/`
+  already owns the RTSP-scan side (realm detection + per-vendor stream paths);
+  **the DVR-feature side belongs there too.** The direction for this codebase is
+  that `motion` / `events` / `diagnose` / `recordings` / `playback` keep only the
+  generic orchestration and delegate every device dialect to a vendor module
+  (`vendors/hikvision.py` being the one implementation that exists). Adding
+  a second vendor by branching inside those modules is the wrong move — extract
+  the Hikvision specifics into the vendor first.
+- When touching any of these features, assume you are editing **Hikvision code**
+  and say so in comments/messages, so a future vendor split is mechanical.
+
 ## The target device (known facts)
 
 - Target: a real Hikvision OEM DVR. **Its IP, ports, and credentials are NOT in
@@ -270,12 +294,21 @@ python3 ivms666.py import --file found.json                 # load scan output i
   well-formed GUID `searchID` or it 400s) on the channel's track over the last N
   hours and returns `{time, seconds, start, end}` per clip (newest first). The UI
   lists them; each row shows **ONE thumbnail grabbed live from the DVR recording** —
-  a single lazy `<img>` at `/playback?...&time=&res=480x270`, sampled ~12s in (just
+  a single `<img>` at `/playback?...&time=&res=480x270`, sampled ~12s in (just
   after the 10s pre-record, where the motion is), via `playback.grab_frame`
   (width-scaled). **One, not three:** this DVR allows only ~one concurrent RTSP
   session (see the 453 gotcha), so 3 thumbs/event × several rows all 453'd — one
-  reliable thumb beats three broken ones. **Never local files** (source of truth =
-  DVR). Click a thumbnail → lightbox (`#imgOverlay`) showing the **same
+  reliable thumb beats three broken ones. **The rows load STRICTLY ONE AT A TIME,
+  client-side** (`app.js`: `thumbQ`/`pumpThumbs`/`thumbFailed`): the `<img>` carries
+  the URL in `data-src` and the loader sets `src` only when it is that row's turn.
+  Browser-native `loading="lazy"` was NOT enough — the browser still fires ~6
+  requests in parallel for the visible rows, and since both the DVR *and*
+  `grab_frame` serve one grab at a time, the extra 5 sat in the server's semaphore
+  until they timed out ("busy: RTSP session in use") and rendered as broken images.
+  A failed row **retries once** (a lingering DVR session drains in tens of seconds)
+  and then shows `⚠ no frame — DVR busy or clip gone` with a **⟳ retry** link —
+  never a bare broken-image icon, which said nothing about why. **Never local files**
+  (source of truth = DVR). Click a thumbnail → lightbox (`#imgOverlay`) showing the **same
   already-loaded image** (`img.src`, browser-cached `immutable`) — instant, no
   second grab, thumbnail-res (good enough; a fresh full-res grab would just 453).
   **▶ Play** streams the clip to an HTML5 `<video controls>` via `/clip` (RTSP
@@ -283,9 +316,25 @@ python3 ivms666.py import --file found.json                 # load scan output i
   session): `_handle_clip` wraps the stream in `playback.rtsp_priority()`, which
   drains the in-flight grab then holds the grab semaphore for the clip's duration,
   so concurrent thumbnail grabs **stand down** (return "busy: playback in progress")
-  instead of 453-ing the clip. The frontend also **pauses** unfinished thumbnails
-  on ▶ Play (`pauseThumbs`, stashes `src`) and **resumes** them on close
-  (`resumeThumbs`), so no thumbnail even requests the DVR while a clip plays.
+  instead of 453-ing the clip. The frontend also **pauses** the thumbnail loader
+  on ▶ Play (`pauseThumbs` — the in-flight row goes back to the FRONT of the queue)
+  and **resumes** it on close (`resumeThumbs`); closing the log clears the queue
+  entirely, so no thumbnail requests the DVR while a clip plays or after you leave.
+  **Per-row actions: `▶ Play | ⬇ | 🔗`.** `⬇` downloads the clip
+  (`/clip?…&download=1` → `Content-Disposition: attachment`) — it is `-c:v copy`,
+  so the download IS the recording's own resolution, nothing is re-encoded. `🔗`
+  copies a **share link** (`/watch?device=&ch=&start=&end=`, `shareClip`) that opens
+  `static/watch.html`, a standalone page playing just that clip. **The link carries
+  no credentials** — only the device id + track + span; the server resolves the
+  camera from `~/.ivms666.json` when the page requests `/clip`. It is not an
+  authentication bypass either: the app has none of its own, so whoever opens it
+  still has to pass **Cloudflare Access** (see Deployment). The event-frame lightbox
+  additionally has **⬇ Download** (re-grabs the same instant WITHOUT `res`, i.e. the
+  recording's full resolution) and **▶ Live view** (jumps to the live stream of that
+  camera); the live-motion popup shows ▶ Live view too. In the Live view, the
+  "⬇ Download frame" button saves the **displayed** frame via canvas — that is the
+  1080p main stream, which is *better* than the DVR's 720p still endpoint, so it
+  deliberately does not re-grab from the device.
   **ffmpeg gotcha:** the DVR's audio is **G.711/pcm_mulaw**,
   which can't be stream-copied into MP4 — `clip_process` uses `-an -c:v copy` (drop
   audio) with `frag_keyframe+empty_moov` so `<video>` plays as bytes arrive.
@@ -306,6 +355,25 @@ python3 ivms666.py import --file found.json                 # load scan output i
   ~3.5s each) instead of all 453; 2nd identical grab = 0ms (cached). The in-memory
   cache is a **perf cache of live-fetched frames, not a data source** — bounded,
   never written to disk, dropped on restart — so it respects the source-of-truth rule.
+- **A STRANDED ffmpeg blocks playback FOREVER (the "event log shows no images"
+  bug).** Symptom: every `/playback` thumbnail 502s with `453 Not Enough Bandwidth`
+  for hours, while **Live view works fine** and `/ISAPI/Streaming/status` reports
+  `totalStreamingSessions 0`. Cause found by `ps`: an **orphaned** clip ffmpeg
+  (`PPID 1`, started by an *earlier* run of the app, `lsof` showing
+  `TCP …->dvr:8556 (ESTABLISHED)`) still held the DVR's single RTSP session. Python
+  does **not** kill subprocesses when it exits, so stopping/restarting the server
+  mid-clip left the child alive; `_handle_clip`'s `finally: terminate()` never ran.
+  Killing that one pid restored playback instantly (grab OK in ~7s, repeatably).
+  **Fixes:** every ffmpeg is spawned through **`live.spawn`** and tracked in
+  `live._procs`; **`live.terminate_all()`** is registered with `atexit` and the GUI
+  installs a **SIGTERM** handler (`sys.exit` → atexit → children die, which is what
+  `docker stop` sends); `clip_process` now also passes **`-timeout`** so a stalled
+  clip cannot hang forever; and `run_gui` calls **`live.kill_orphans(config.device_hosts())`**
+  at startup to reclaim children stranded by a previous `kill -9` (matched narrowly:
+  ffmpeg + `rtsp://` + one of OUR device hosts + parent gone, so nothing else is touched).
+  **Debug recipe** when thumbnails die again: `ps -Ao pid=,ppid=,command= | grep ffmpeg`
+  → any `rtsp://<dvr>` with `PPID 1` is a leak; `/ISAPI/Streaming/status` showing 0
+  sessions does NOT mean the DVR is free.
 - **A still from a past recording is EXPENSIVE on this DVR** — measured:
   ffmpeg-from-RTSP-playback ~4–9s (flaky, and one-at-a-time per above), HTTP
   `/ISAPI/ContentMgmt/download` ~19s + proprietary `IMKH` container, and the
@@ -459,17 +527,18 @@ motion.py                 # gridMap codec + get_motion / set_motion (read-modify
 events.py                 # motion ALERT stream: per-device daemon watches /ISAPI/Event/notification/alertStream, tracks per-channel VMD state (hold window) for the live badge/popup (skips kind=rtsp). get_state / start_all / ensure / stop
 store.py                  # server-side snapshot saving to config save_path (save_snapshot = ISAPI still; save_bytes = pre-grabbed bytes, used for RTSP)
 diagnose.py               # per-device health check + safe auto-fix. Live channels: motion enabled/area, VMD email+center linkage, motion-rec 10s pre/post, max-res. Unused channels (NO VIDEO input or hidden tile): only "recording left on" -> disable track. Device-wide: SMTP + DVR clock (System/time) skew -> set correct local time
-live.py                   # RTSP->MJPEG via ffmpeg (Live view); rtsp_url (stored URL for kind=rtsp) + check + open_mjpeg + grab_still (one frame, for RTSP tiles/Save); -timeout so dead streams fail fast; SAR->square-pixel so streams aren't squished
+live.py                   # RTSP->MJPEG via ffmpeg (Live view); rtsp_url (stored URL for kind=rtsp) + check + open_mjpeg + grab_still (one frame, for RTSP tiles/Save); -timeout so dead streams fail fast; SAR->square-pixel so streams aren't squished. ALSO the ffmpeg child registry: spawn/terminate/terminate_all (atexit) + kill_orphans — every ffmpeg in the app goes through spawn(), or a stranded one blocks the DVR's single RTSP session
 playback.py               # recorded playback: one still at a chosen time via RTSP tracks + ffmpeg; to_span + playback_url + grab_frame (serialized to 1 RTSP session, retries RTSP 453, in-memory frame cache) + rtsp_priority() (clip playback pauses grabs)
 recordings.py             # motion event log + clip video: list_events (CMSearch POST /ISAPI/ContentMgmt/search on the motion track) + clip_process (RTSP playback -> ffmpeg fragmented MP4, audio dropped)
 scan.py                   # rtsp-scan: windowed probe (window of --parallel IPs, port-major) + ONE shared budget of `workers` slots for probe+verify combined (a found port hands its slot from probing to verifying; total in-flight <= workers) — scan_and_verify + probe_rtsp + find_credential(_ex) + enumerate_streams (vendor+channel enumeration + credential/attempts/reason) + probe_streams (streams-only wrapper) + expand_range/expand_ranges + rtsp_link + device_entry
 vendors/                  # one module per camera/DVR family (Vendor: realm keywords + per-stream path groups + channel walk w/ early-stop). __init__.detect(realm)/enumeration_order(); add a device here, not in scan.py
 default_config.json       # USER-OWNED runtime input (devices=[], scan range/ports). Assistant: never read/edit. config.py reads it at runtime only.
-web.py                    # loads static/index.html + static/app.js
+web.py                    # loads static/index.html + static/app.js + static/watch.html (shared-link player)
 server.py                 # BaseHTTPRequestHandler routes + ThreadingHTTPServer + run_gui()
 cli.py                    # argparse: GUI (default), `discover`, `rtsp-scan`, `import`
-static/index.html         # markup + CSS (frontend)
+static/index.html         # markup + CSS (frontend). Overlays have EXPLICIT z-index (img 52 < live 54 < vid 56) — the event log sits later in the DOM and would otherwise cover a Live view opened from an event frame
 static/app.js             # all frontend JS
+static/watch.html         # standalone player for a shared event link (/watch) — self-contained, no app.js
 tests/                    # unittest; helpers.py has the fake camera transport + FakeProc
 ```
 
@@ -510,6 +579,8 @@ the name up on the module at call time. Preserve this pattern.
 | GET | `/playback?device=<id>&ch=<track>&time=<ISO>` | one max-res still from the recording at a time |
 | GET | `/events?device=<id>&ch=<track>&hours=<n>` | motion event log (CMSearch over the last n hours) → `{events:[{time,seconds,start,end}]}` |
 | GET | `/clip?device=<id>&ch=<track>&start=&end=` | one motion clip as MP4 (RTSP playback→ffmpeg, streamed) |
+| GET | `/watch?device=<id>&ch=&start=&end=` | **shared-link player page** (`static/watch.html`) — plays that one recording; the link holds NO credentials |
+| GET | `/watch/info?device=<id>` | camera **name only**, for the shared page's title |
 | GET | `/live/check?device=<id>` | pre-flight: ffmpeg present + RTSP port reachable |
 | GET | `/live?device=<id>&ch=<cid>&stream=main\|sub` | live MJPEG stream (RTSP→ffmpeg), runs until the browser disconnects |
 | GET | `/audio?device=<id>&ch=<cid>` | audio-only stream as MP3 (RTSP→ffmpeg `-vn -f mp3`), for the "Listen" player on a no-video stream |

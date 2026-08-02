@@ -11,7 +11,6 @@ playback URL wants `20260726T080134Z`.
 """
 
 import re
-import subprocess
 import time
 from datetime import datetime
 
@@ -44,7 +43,11 @@ SEARCH = "/ISAPI/ContentMgmt/search"
 # Audio is dropped (-an): this DVR records G.711/pcm_mulaw, which can't be
 # stream-copied into MP4. `frag_keyframe+empty_moov` makes a fragmented MP4 that
 # an HTML5 <video> can start playing as bytes arrive (no full-file wait).
+# `-timeout` (µs) matters here as much as the muxer flags: without it a clip whose
+# RTSP stream stalls hangs forever, and that hung ffmpeg holds the DVR's single
+# session — every event thumbnail then comes back 453.
 _FFMPEG_CLIP = ["ffmpeg", "-nostdin", "-loglevel", "error", "-rtsp_transport", "tcp",
+                "-timeout", live.RTSP_TIMEOUT_US,
                 "-i", "{url}", "-an", "-c:v", "copy",
                 "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "-"]
 
@@ -97,7 +100,7 @@ def clip_process(cfg, track_id, start, end):
     as fragmented MP4 on stdout. Caller terminates it when the client leaves."""
     url = playback.playback_url(cfg, track_id, start, end)
     cmd = [a.format(url=url) for a in _FFMPEG_CLIP]
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return live.spawn(cmd)
 
 
 ffmpeg_available = live.ffmpeg_available

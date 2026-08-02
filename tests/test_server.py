@@ -108,6 +108,19 @@ class ServerTest(unittest.TestCase):
             finally:
                 e.close()
 
+    def req_headers(self, path):
+        """(status, headers) — for asserting on Content-Disposition etc."""
+        r = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", method="GET")
+        try:
+            with urllib.request.urlopen(r, timeout=10) as resp:
+                resp.read()
+                return resp.status, dict(resp.headers)
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, dict(e.headers)
+            finally:
+                e.close()
+
     def add_device(self):
         st, b = self.req("POST", "/devices",
                          {"name": "T", "host": "1.1.1.1", "port": "8001",
@@ -430,6 +443,47 @@ class ServerTest(unittest.TestCase):
             self.assertIn(b"MP4CLIPDATA", b)
         finally:
             recordings.ffmpeg_available, recordings.clip_process = orig_av, orig_proc
+
+    def test_clip_download_sends_attachment_filename(self):
+        _, dev = self.add_device()
+        orig_av, orig_proc = recordings.ffmpeg_available, recordings.clip_process
+        recordings.ffmpeg_available = lambda: True
+        recordings.clip_process = lambda cfg, ch, start, end: FakeProc(b"MP4CLIPDATA")  # noqa
+        try:
+            st, h = self.req_headers(f"/clip?device={dev['id']}&ch=101"
+                                     "&start=20260726T080134Z&end=20260726T080151Z&download=1")
+            self.assertEqual(st, 200)
+            self.assertIn("attachment", h["Content-Disposition"])
+            self.assertIn("T-ch101-20260726T080134Z.mp4", h["Content-Disposition"])
+        finally:
+            recordings.ffmpeg_available, recordings.clip_process = orig_av, orig_proc
+
+    def test_playback_download_sends_attachment_filename(self):
+        _, dev = self.add_device()
+        orig_av, orig_grab = live.ffmpeg_available, playback.grab_frame
+        live.ffmpeg_available = lambda: True
+        playback.grab_frame = lambda url, timeout=25, width=None: (FAKE_JPEG, "")
+        try:
+            st, h = self.req_headers(
+                f"/playback?device={dev['id']}&ch=101&time=2026-07-25T14:00:00&download=1")
+            self.assertEqual(st, 200)
+            self.assertIn("attachment", h["Content-Disposition"])
+            self.assertTrue(h["Content-Disposition"].endswith('.jpg"'))
+        finally:
+            live.ffmpeg_available, playback.grab_frame = orig_av, orig_grab
+
+    def test_watch_page_and_info_expose_no_credentials(self):
+        _, dev = self.add_device()
+        st, body = self.req("GET", "/watch")
+        self.assertEqual(st, 200)
+        self.assertIn(b"<video", body)
+        st2, info = self.req("GET", f"/watch/info?device={dev['id']}&ch=101")
+        self.assertEqual(st2, 200)
+        self.assertEqual(json.loads(info)["name"], "T")
+        self.assertNotIn(b"secret", info)          # the share flow never leaks the password
+        self.assertNotIn(b"rtsp://", info)
+        st3, _ = self.req("GET", "/watch/info?device=gone")
+        self.assertEqual(st3, 404)
 
     def test_clip_requires_ffmpeg(self):
         _, dev = self.add_device()

@@ -192,6 +192,18 @@ def get_cfg(device_id):
         return device_cfg(d) if d else None
 
 
+def device_hosts():
+    """Every configured device host (no credentials). Used to recognise OUR
+    stranded ffmpeg streams at startup — see live.kill_orphans."""
+    with _lock:
+        hosts = {d.get("host") for d in _state["devices"] if d.get("host")}
+        for d in _state["devices"]:   # legacy opaque URL: host lives inside it
+            m = re.search(r"://(?:[^/]*@)?([^:/]+)", d.get("rtsp_url") or "")
+            if m:
+                hosts.add(m.group(1))
+    return sorted(hosts)
+
+
 def _to_bool(v, default=False):
     if v is None:
         return default

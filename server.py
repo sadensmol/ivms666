@@ -21,12 +21,20 @@ Routes:
     GET  /playback?device=<id>&ch=<track>&time=<YYYY-MM-DDTHH:MM:SS>  one recorded still (max-res)
     GET  /events?device=<id>&ch=<track>&hours=<n>   motion event log (from recordings)
     GET  /clip?device=<id>&ch=<track>&start=&end=   one motion clip as MP4 (RTSP->ffmpeg)
+    GET  /watch?device=<id>&ch=&start=&end=         shared player page (no creds in the link)
+    GET  /watch/info?device=<id>                    camera NAME only, for the shared page title
+
+`&download=1` on /clip, /playback and /snapshot adds a Content-Disposition so the
+browser saves the file (the clip is stream-copied, i.e. the recording's own quality).
 """
 
 import http.server
 import json
 import os
+import re
+import signal
 import socketserver
+import sys
 import threading
 import urllib.error
 import webbrowser
@@ -37,6 +45,26 @@ import camera, config, diagnose, events, live, motion, playback, recordings, sto
 
 _LIVE_FIRST_READ = 512   # bytes to wait for before declaring the stream alive
 _LIVE_CHUNK = 8192
+
+
+def _safe_name(text, fallback="camera"):
+    """A filename-safe slug — a Content-Disposition filename must not carry quotes,
+    slashes or newlines (header injection / broken save dialogs)."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(text or "")).strip("-")
+    return slug[:60] or fallback
+
+
+def _clip_filename(device_id, q):
+    """`<device>-ch<track>-<start>.mp4` for a downloaded motion clip."""
+    return (f"{_safe_name(config.device_label(device_id))}"
+            f"-ch{_safe_name(q.get('ch', '101'))}"
+            f"-{_safe_name(q.get('start', 'clip'))}.mp4")
+
+
+def _still_filename(device_id, ch, when):
+    """`<device>-ch<id>-<time>.jpg` for a downloaded frame (event frame or live)."""
+    stamp = _safe_name(when, "") or datetime.now().strftime("%Y%m%dT%H%M%S")
+    return f"{_safe_name(config.device_label(device_id))}-ch{_safe_name(ch)}-{stamp}.jpg"
 
 
 def _rtsp_reason(err):
@@ -98,6 +126,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/app.js":
             self._send(200, web.app_js(), "application/javascript; charset=utf-8", {"Cache-Control": "no-store"})
+            return
+        if path == "/watch":   # shared event link — plays one clip, no credentials in the URL
+            self._send(200, web.watch_page(), "text/html; charset=utf-8", {"Cache-Control": "no-store"})
+            return
+        if path == "/watch/info":   # what the shared page shows in its title — name only
+            q = self._query()
+            device_id = q.get("device", "")
+            if not config.get_cfg(device_id):
+                self._json(404, {"error": "unknown or removed camera"})
+                return
+            self._json(200, {"name": config.device_label(device_id), "ch": q.get("ch", "")})
             return
         if path == "/devices":
             self._json(200, config.list_devices())
@@ -276,6 +315,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "video/mp4")
             self.send_header("Cache-Control", "no-store")
+            # `&download=1` -> the browser saves the file instead of playing it. The
+            # clip is already the recording's own H.264 stream-copied (`-c:v copy`),
+            # i.e. the DVR's highest resolution — there is no re-encode to lose.
+            if q.get("download"):
+                self.send_header("Content-Disposition",
+                                 f'attachment; filename="{_clip_filename(q.get("device", ""), q)}"')
             self.end_headers()
             try:
                 self.wfile.write(first)
@@ -314,7 +359,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         # a recorded frame at a fixed past instant never changes -> let the browser
         # cache it so clicking the thumbnail (same URL) is instant and never re-grabs.
-        self._send(200, data, "image/jpeg", {"Cache-Control": "max-age=86400, immutable"})
+        headers = {"Cache-Control": "max-age=86400, immutable"}
+        if q.get("download"):   # no `res` on the request -> the recording's own resolution
+            headers["Content-Disposition"] = \
+                f'attachment; filename="{_still_filename(q.get("device", ""), q.get("ch", "101"), q.get("time", ""))}"'
+        self._send(200, data, "image/jpeg", headers)
 
     def _handle_camera_get(self, path, cfg):
         # A URL-only RTSP device has no ISAPI: one synthetic channel, and its still
@@ -328,7 +377,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif path == "/snapshot":
                 q = self._query()
                 ctype, data = camera.fetch_snapshot(cfg, q.get("ch", "101"), q.get("res"))
-                self._send(200, data, ctype, {"Cache-Control": "no-store"})
+                headers = {"Cache-Control": "no-store"}
+                if q.get("download"):   # "⬇ Download frame" in the Live view
+                    headers["Content-Disposition"] = \
+                        f'attachment; filename="{_still_filename(q.get("device", ""), q.get("ch", "101"), "")}"'
+                self._send(200, data, ctype, headers)
             else:  # /motion
                 self._json(200, motion.get_motion(cfg, self._query().get("input", "1")))
         except Exception as e:  # noqa: BLE001 - surface any camera failure to the UI
@@ -361,7 +414,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             self._send(502, "stream grab failed: " + _rtsp_reason(err))
             return
-        self._send(200, data, "image/jpeg", {"Cache-Control": "no-store"})
+        headers = {"Cache-Control": "no-store"}
+        if q.get("download"):
+            headers["Content-Disposition"] = \
+                f'attachment; filename="{_still_filename(q.get("device", ""), "rtsp", "")}"'
+        self._send(200, data, "image/jpeg", headers)
 
     # --- POST --------------------------------------------------------------
     def do_POST(self):
@@ -531,6 +588,12 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 def run_gui():
     config.load()
+    # A previous run that was killed (not stopped) can leave an ffmpeg behind, and
+    # that child keeps the DVR's single RTSP session open — every playback grab then
+    # answers 453 and the event log shows only broken thumbnails. Reclaim it first.
+    stranded = live.kill_orphans(config.device_hosts())
+    if stranded:
+        print(f"Reclaimed {len(stranded)} stranded ffmpeg stream(s) from a previous run.")
     events.start_all()  # begin watching every device for motion (works headless)
     url = f"http://{config.LISTEN_HOST}:{config.LISTEN_PORT}/"
     server = Server((config.LISTEN_HOST, config.LISTEN_PORT), Handler)
@@ -544,8 +607,12 @@ def run_gui():
             webbrowser.open(url)
         except Exception:
             pass
+    # `docker stop` (and `kill`) send SIGTERM: exit through the normal path so
+    # atexit runs live.terminate_all() and no ffmpeg keeps an RTSP session open.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
         server.serve_forever()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         print("\nStopped.")
         server.shutdown()
+        live.terminate_all()
