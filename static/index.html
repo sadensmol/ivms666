@@ -162,6 +162,10 @@
   .live-stage { display: flex; align-items: center; justify-content: center;
                 background: #000; border-radius: 0 0 12px 12px; overflow: hidden; }
   .live-stage img { max-width: 96vw; max-height: 82vh; display: block; }
+  /* prev/next frame arrows in the lightbox title bar (hidden for the motion popup) */
+  .framenav { padding: 4px 11px; font-size: 15px; line-height: 1; }
+  .framenav[disabled] { opacity: .3; cursor: default; }
+  #imgOverlay.motion .framenav { display: none; }   /* live motion popup has no frame list to page */
   .lpill { font-size: 12px; color: #7ee787; background: #14261a; border: 1px solid #204a2c;
            padding: 3px 8px; border-radius: 999px; }
   /* motion popup: a big, unmissable alert even before the image loads */
@@ -290,7 +294,10 @@
 <!-- Single image popup: the motion-detected snapshot AND the event-frame lightbox -->
 <div class="overlay live" id="imgOverlay">
   <div class="modal live">
-    <div class="mhead"><h2 id="imgTitle">Image</h2><span class="grow"></span>
+    <div class="mhead"><h2 id="imgTitle">Image</h2>
+      <button class="framenav secondary" id="imgPrev" title="Previous (newer) frame — ↑ / ←">↑</button>
+      <button class="framenav secondary" id="imgNext" title="Next (older) frame — ↓ / →">↓</button>
+      <span class="grow"></span>
       <button id="imgDownload">⬇ Download</button>
       <button class="secondary" id="imgLive">▶ Live view</button>
       <button class="secondary" id="imgClose">Close</button></div>
@@ -307,6 +314,7 @@
       <span class="grow"></span>
       <span class="mmsg" id="vidMsg"></span>
       <button id="vidDownload">⬇ Download</button>
+      <button class="secondary" id="vidShare" title="Copy a link that plays this recording (no credentials in the link)">🔗 Share</button>
       <button class="secondary" id="vidClose">Close</button></div>
     <div class="live-stage"><video id="vidPlayer" controls style="max-width:96vw;max-height:82vh"></video></div>
   </div>

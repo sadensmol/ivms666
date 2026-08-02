@@ -107,6 +107,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _json(self, code, obj):
         self._send(code, json.dumps(obj), "application/json")
 
+    # --- long-lived streaming responses (live MJPEG, audio, clip) ----------
+    # A reverse proxy like cloudflared REJECTS an HTTP/1.0 close-delimited body
+    # (no Content-Length AND no chunked framing) with a 502 Bad Gateway. That is
+    # exactly what the old `send_response(200)` + raw `wfile.write` loop produced,
+    # which is why Live/audio/clips worked on localhost but 502'd behind Cloudflare
+    # while every other endpoint (bounded, Content-Length via `_send`) was fine.
+    # Streaming with HTTP/1.1 chunked framing gives the proxy explicit boundaries
+    # it can re-emit to the edge. Browsers handle chunked MJPEG/MP4 natively, so
+    # the local path is unchanged.
+    def _stream_start(self, ctype, extra=None):
+        self.protocol_version = "HTTP/1.1"    # chunked transfer-encoding is undefined in HTTP/1.0
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "close")  # one-shot stream; close when it ends
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+
+    def _stream_write(self, data):
+        if data:
+            self.wfile.write(b"%X\r\n" % len(data) + data + b"\r\n")
+
+    def _stream_end(self):
+        self.wfile.write(b"0\r\n\r\n")
+
     def _query(self):
         return {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
 
@@ -247,17 +274,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # Drain stderr in the background so its pipe never blocks ffmpeg mid-stream.
         threading.Thread(target=lambda: proc.stderr.read(), daemon=True).start()
-        self.send_response(200)
-        self.send_header("Content-Type", live.MJPEG_CONTENT_TYPE)
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
+        self._stream_start(live.MJPEG_CONTENT_TYPE)
         try:
-            self.wfile.write(first)
+            self._stream_write(first)
             while True:
                 chunk = proc.stdout.read(_LIVE_CHUNK)
                 if not chunk:
                     break
-                self.wfile.write(chunk)
+                self._stream_write(chunk)
+            self._stream_end()
         except (BrokenPipeError, ConnectionResetError):
             pass  # browser closed the Live window
         finally:
@@ -278,17 +303,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(502, "audio stream failed: " + _rtsp_reason(err))
             return
         threading.Thread(target=lambda: proc.stderr.read(), daemon=True).start()
-        self.send_response(200)
-        self.send_header("Content-Type", live.AUDIO_CONTENT_TYPE)
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
+        self._stream_start(live.AUDIO_CONTENT_TYPE)
         try:
-            self.wfile.write(first)
+            self._stream_write(first)
             while True:
                 chunk = proc.stdout.read(_LIVE_CHUNK)
                 if not chunk:
                     break
-                self.wfile.write(chunk)
+                self._stream_write(chunk)
+            self._stream_end()
         except (BrokenPipeError, ConnectionResetError):
             pass  # browser closed the Audio window
         finally:
@@ -312,23 +335,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(502, "clip failed: " + (err or "no recording for that time, or RTSP port unreachable"))
                 return
             threading.Thread(target=lambda: proc.stderr.read(), daemon=True).start()
-            self.send_response(200)
-            self.send_header("Content-Type", "video/mp4")
-            self.send_header("Cache-Control", "no-store")
             # `&download=1` -> the browser saves the file instead of playing it. The
             # clip is already the recording's own H.264 stream-copied (`-c:v copy`),
             # i.e. the DVR's highest resolution — there is no re-encode to lose.
+            extra = {}
             if q.get("download"):
-                self.send_header("Content-Disposition",
-                                 f'attachment; filename="{_clip_filename(q.get("device", ""), q)}"')
-            self.end_headers()
+                extra["Content-Disposition"] = \
+                    f'attachment; filename="{_clip_filename(q.get("device", ""), q)}"'
+            self._stream_start("video/mp4", extra)
             try:
-                self.wfile.write(first)
+                self._stream_write(first)
                 while True:
                     chunk = proc.stdout.read(_LIVE_CHUNK)
                     if not chunk:
                         break
-                    self.wfile.write(chunk)
+                    self._stream_write(chunk)
+                self._stream_end()
             except (BrokenPipeError, ConnectionResetError):
                 pass  # browser closed the player
             finally:

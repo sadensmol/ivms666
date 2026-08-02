@@ -312,7 +312,10 @@ or does not expose the feature at all.
   already-loaded image** (`img.src`, browser-cached `immutable`) — instant, no
   second grab, thumbnail-res (good enough; a fresh full-res grab would just 453).
   **▶ Play** streams the clip to an HTML5 `<video controls>` via `/clip` (RTSP
-  playback → ffmpeg). **Clip playback takes RTSP priority** (the DVR serves ~one
+  playback → ffmpeg). The player overlay (`#vidOverlay`) header carries **⬇ Download
+  | 🔗 Share | Close** — the **🔗 Share** button (`vidShare`) copies the SAME
+  `/watch` link as the per-row 🔗 (`shareClip(VID.start, VID.end)`, no credentials),
+  so you can share while watching. **Clip playback takes RTSP priority** (the DVR serves ~one
   session): `_handle_clip` wraps the stream in `playback.rtsp_priority()`, which
   drains the in-flight grab then holds the grab semaphore for the clip's duration,
   so concurrent thumbnail grabs **stand down** (return "busy: playback in progress")
@@ -330,8 +333,24 @@ or does not expose the feature at all.
   authentication bypass either: the app has none of its own, so whoever opens it
   still has to pass **Cloudflare Access** (see Deployment). The event-frame lightbox
   additionally has **⬇ Download** (re-grabs the same instant WITHOUT `res`, i.e. the
-  recording's full resolution) and **▶ Live view** (jumps to the live stream of that
-  camera); the live-motion popup shows ▶ Live view too. In the Live view, the
+  recording's full resolution) and **▶ Play** — the lightbox's ▶ button is
+  **context-aware** (`imgPlayOrLive`): on an **event frame** it **plays that
+  recorded event's clip** (`playClip(start,end)` → `/clip`, opening the `#vidOverlay`
+  player), NOT live view. The event's clip span rides on the thumbnail as
+  `data-start`/`data-end` (carried into `imgCtx`); `time` is only the still's
+  instant (for ⬇ Download). The **live-motion popup** keeps the SAME button as
+  **▶ Live view** (jumps to the live stream) since there is no recorded clip to
+  play — the label + action switch on `motCur` vs `imgCtx.start/end`. **Paging between event
+  frames:** the lightbox title bar has **↑ / ↓** buttons (and **ArrowUp/Left = ↑
+  previous/newer**, **ArrowDown/Right = ↓ next/older**) that step to the adjacent
+  event's frame in the open log — newest-first, so ↑ is a newer event, ↓ an older
+  one (`navFrame`/`showFrame`/`updateFrameNav`; the current row is located by its
+  `data-t` time, arrows disable at each end). An already-loaded frame is
+  browser-cached (immutable) → instant; paging to a not-yet-loaded row sets the
+  same `/playback` URL and grabs it live (one RTSP session at a time, title shows
+  "loading…"/"⚠ no frame"). The arrows are **hidden for the live-motion popup**
+  (`#imgOverlay.motion .framenav`, `motCur` set → `updateFrameNav` hides them) —
+  it shares `#imgOverlay` but has no frame list to page. In the Live view, the
   "⬇ Download frame" button saves the **displayed** frame via canvas — that is the
   1080p main stream, which is *better* than the DVR's 720p still endpoint, so it
   deliberately does not re-grab from the device.
@@ -664,6 +683,22 @@ when editing code:
   `/opt/ivms666/.env` on the droplet and must never move into GitHub.
 - **The DVR must be internet-reachable** from the droplet, and its ~one-concurrent
   -RTSP-session cap is now shared with anyone watching from home (expect 453s).
+- **Streaming responses MUST be HTTP/1.1 chunked, never HTTP/1.0 close-delimited —
+  or cloudflared 502s them.** The long-lived endpoints (`/live` MJPEG, `/audio`
+  MP3, `/clip` MP4) stream an unbounded body. `http.server` defaults to HTTP/1.0,
+  and the old handlers did `send_response(200)` + raw `wfile.write` with **no
+  Content-Length and no chunked framing** — a close-delimited body. **cloudflared
+  rejects a close-delimited origin body with `502 Bad Gateway`** (it needs
+  Content-Length *or* chunked to frame the response back to the Cloudflare edge).
+  Symptom: Live/clips work on `localhost` but show Cloudflare's branded 502 page
+  from a phone/remote; every *other* endpoint is fine because `_send` always sets
+  Content-Length. Fix (`server.Handler._stream_start/_stream_write/_stream_end`):
+  the three streaming handlers set `self.protocol_version="HTTP/1.1"`, send
+  `Transfer-Encoding: chunked` + `Connection: close`, and length-prefix every
+  write (`b"%X\r\n"+data+b"\r\n"`, terminated by `0\r\n\r\n`). The pre-flight
+  failure 502 (`_send`, bounded) is unchanged. Browsers decode chunked MJPEG/MP4
+  natively, so the local path is identical. **Don't revert a streaming handler to
+  bare `wfile.write` — it silently breaks the deployed (Cloudflare) path only.**
 
 ## Device gotchas / hard-won facts (running log — append as you learn)
 

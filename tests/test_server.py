@@ -371,6 +371,10 @@ class ServerTest(unittest.TestCase):
             st, b = self.req("GET", f"/live?device={dev['id']}&ch=101&stream=main")
             self.assertEqual(st, 200)
             self.assertIn(b"JPEGDATA", b)
+            # Must be HTTP/1.1 chunked, not an HTTP/1.0 close-delimited body:
+            # cloudflared 502s the latter (works on localhost, breaks behind Cloudflare).
+            _, hdrs = self.req_headers(f"/live?device={dev['id']}&ch=101&stream=main")
+            self.assertEqual(hdrs.get("Transfer-Encoding"), "chunked")
         finally:
             live.ffmpeg_available, live.open_mjpeg = orig_avail, orig_open
 

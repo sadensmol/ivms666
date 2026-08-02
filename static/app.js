@@ -586,15 +586,57 @@ function closeImg() {
   if (motTimer) { clearInterval(motTimer); motTimer=null; }
   motCur = null; imgCtx = null;
   $('imgOverlay').classList.remove('open'); $('imgOverlay').classList.remove('motion');
+  $('imgBig').onload = $('imgBig').onerror = null;
   $('imgBig').removeAttribute('src');
+  updateFrameNav();
 }
-function showImage(src, title, ctx) {   // static image (event-frame thumbnail)
+// Open the event-frame lightbox on one thumbnail; ‹ › (and ↑↓/←→) then page to the
+// adjacent event's frame in the log. `img` is the row's <img>.
+function openEventFrame(img) {
   closeImg();
-  imgCtx = ctx || null;                // what ⬇ Download / ▶ Live view act on
-  $('imgTitle').textContent = title || 'Image';
-  $('imgBig').src = src;
-  $('imgLive').style.display = imgCtx ? '' : 'none';
+  showFrame(img);
   openImg();
+}
+// Show one frame in the lightbox. A frame the log already loaded is browser-cached
+// (immutable) -> instant; paging to a not-yet-loaded row sets the same /playback URL,
+// which grabs it from the DVR (a few seconds, one RTSP session at a time — see below).
+function showFrame(img) {
+  const t = img.dataset.t, base = 'Event frame · ' + t.replace('T', ' ');
+  // `start`/`end` are the event's clip span -> the ▶ Play button plays THIS event
+  // (not live view); `time` is the still's instant, for ⬇ Download.
+  imgCtx = { deviceId: EV.d.id, chId: EV.ch.id, time: t,
+             start: img.dataset.start, end: img.dataset.end };
+  const big = $('imgBig');
+  big.onload  = () => { $('imgTitle').textContent = base; };
+  big.onerror = () => { $('imgTitle').textContent = base + '  ·  ⚠ no frame (DVR busy or clip gone)'; };
+  const loaded = img.complete && img.naturalWidth;
+  $('imgTitle').textContent = loaded ? base : base + '  ·  loading…';
+  big.src = img.currentSrc || img.dataset.src;
+  $('imgLive').textContent = '▶ Play';   // event frame -> play the recorded event
+  $('imgLive').style.display = '';
+  updateFrameNav();
+}
+// Page to the frame `delta` rows away (newest-first: -1 = newer/‹/↑, +1 = older/›/↓).
+function navFrame(delta) {
+  if (!imgCtx || motCur) return;
+  const thumbs = [...$('evBody').querySelectorAll('.evthumb')];
+  const i = thumbs.findIndex(t => t.dataset.t === imgCtx.time);
+  const target = thumbs[i + delta];
+  if (i < 0 || !target) return;   // current row gone (re-render) or at an edge
+  showFrame(target);
+}
+// Show/enable the ‹ › arrows only for an event frame (not the live motion popup),
+// disabling each at its end of the list.
+function updateFrameNav() {
+  const prev = $('imgPrev'), next = $('imgNext');
+  if (!prev || !next) return;
+  const on = !!imgCtx && !motCur;
+  prev.style.display = next.style.display = on ? '' : 'none';
+  if (!on) return;
+  const thumbs = [...$('evBody').querySelectorAll('.evthumb')];
+  const i = thumbs.findIndex(t => t.dataset.t === imgCtx.time);
+  prev.disabled = i <= 0;
+  next.disabled = i < 0 || i >= thumbs.length - 1;
 }
 // The lightbox shows a downscaled thumbnail (that is all the DVR gave us cheaply);
 // ⬇ Download asks for the SAME instant WITHOUT `res`, i.e. the recording's own
@@ -607,7 +649,15 @@ function downloadFromImg() {
   download('/playback?device='+encodeURIComponent(imgCtx.deviceId)+'&ch='+encodeURIComponent(imgCtx.chId)+
            '&time='+encodeURIComponent(imgCtx.time)+'&download=1');
 }
-function liveFromImg() {
+// The lightbox's ▶ button is context-aware: a live-motion alert jumps to Live view,
+// while an event frame PLAYS that recorded event (its clip), not live.
+function imgPlayOrLive() {
+  if (!motCur && imgCtx && imgCtx.start && imgCtx.end) {   // event frame -> play the recorded event
+    const s = imgCtx.start, e = imgCtx.end;
+    closeImg();
+    playClip(s, e);
+    return;
+  }
   const c = motCur ? {deviceId:motCur.deviceId, chId:motCur.chId} : imgCtx;
   if (!c) return;
   const d = devices.find(x=>x.id===c.deviceId);
@@ -624,9 +674,13 @@ function showMotionPopup(d, ch) {
   // Don't cover a window that's already showing video (Live view or clip playback);
   // over everything else the motion alert should still pop.
   if ($('liveOverlay').classList.contains('open') || $('vidOverlay').classList.contains('open')) return;
+  imgCtx = null;                             // leaving any event-frame view -> no frame paging here
+  $('imgBig').onload = $('imgBig').onerror = null;   // drop a prior event frame's title handlers
   motCur = { deviceId:d.id, chId:ch.id, input:String(ch.input), name:ch.name, dname:d.name, host:d.host };
   $('imgOverlay').classList.add('motion');   // red accent for the alert
+  $('imgLive').textContent = '▶ Live view';  // motion alert -> jump to Live (event frames say "▶ Play")
   $('imgLive').style.display = '';           // jump straight from the alert to Live view
+  updateFrameNav();                          // motCur set -> hides the ↑ ↓ arrows
   refreshMotionImg();
   openImg();
   if (motTimer) clearInterval(motTimer);
@@ -677,7 +731,8 @@ function renderEvents(events) {
     // browser's usual 6 parallel image requests would queue behind the server's grab
     // lock and time out (that is what turned most rows into broken images).
     const thumb='<div class="evthumbs"><img class="evthumb" data-src="'+escapeHtml(dvrFrameUrl(t,'480x270'))+'" '+
-             'data-t="'+escapeHtml(t)+'" alt=""><span class="evwait">…</span></div>';
+             'data-t="'+escapeHtml(t)+'" data-start="'+escapeHtml(ev.start)+'" data-end="'+escapeHtml(ev.end)+'" '+
+             'alt=""><span class="evwait">…</span></div>';
     html+='<div class="evrow"><div class="evmeta"><span class="evtime">'+escapeHtml(ev.time.replace('T',' '))+'</span>'+
           '<span class="evdur">'+ev.seconds+'s</span></div>'+
           thumb+
@@ -696,8 +751,7 @@ function renderEvents(events) {
   $('evBody').querySelectorAll('.evthumb').forEach(img=>{
     img.onclick=()=>{
       if (!img.complete || !img.naturalWidth) return;   // not loaded yet -> nothing cached
-      showImage(img.currentSrc||img.src, 'Event frame · '+img.dataset.t.replace('T',' '),
-                {deviceId:EV.d.id, chId:EV.ch.id, time:img.dataset.t});
+      openEventFrame(img);   // ‹ › / ↑↓ then page to adjacent event frames
     };
     img.onload=()=>thumbLoaded(img);
     img.onerror=()=>thumbFailed(img);
@@ -1076,11 +1130,20 @@ $('evClose').onclick=()=>{ thumbQ=[]; thumbBusy=null; $('evOverlay').classList.r
 $('evHours').onchange=loadEvents;
 $('vidClose').onclick=closeVid;
 $('vidDownload').onclick=()=>{ if (VID.start) downloadClip(VID.start, VID.end); };
+$('vidShare').onclick=()=>{ if (VID.start) shareClip($('vidShare'), VID.start, VID.end); };  // same /watch link as the row 🔗
 $('vidSpeed').onchange=()=>{ $('vidPlayer').playbackRate=parseFloat($('vidSpeed').value)||1; };
 $('imgClose').onclick=closeImg;
 $('imgDownload').onclick=downloadFromImg;
-$('imgLive').onclick=liveFromImg;
+$('imgLive').onclick=imgPlayOrLive;
+$('imgPrev').onclick=()=>navFrame(-1);   // ↑ newer event frame
+$('imgNext').onclick=()=>navFrame(+1);   // ↓ older event frame
 $('imgOverlay').onclick=e=>{ if(e.target===$('imgOverlay')) closeImg(); };  // click backdrop to close
+// Arrow keys page through the event-frame log while the lightbox is open (not the motion popup).
+window.addEventListener('keydown', e=>{
+  if (!$('imgOverlay').classList.contains('open') || !imgCtx) return;
+  if (e.key==='ArrowUp'   || e.key==='ArrowLeft')  { e.preventDefault(); navFrame(-1); }
+  else if (e.key==='ArrowDown' || e.key==='ArrowRight') { e.preventDefault(); navFrame(+1); }
+});
 $('devClose').onclick=()=>$('devOverlay').classList.remove('open');
 $('devSave').onclick=saveDevice;
 $('refresh').onclick=refreshAll;
