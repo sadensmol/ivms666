@@ -12,32 +12,59 @@ playback URL wants `20260726T080134Z`.
 
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import camera, live, playback
 
-_offset_cache = {}  # host -> (offset_secs, expiry_monotonic)
+_clock_cache = {}  # host -> ((skew_secs, tzinfo), expiry_monotonic)
 
 
-def time_offset(cfg):
-    """Seconds to ADD to a DVR wall-clock time to get THIS host's wall clock — the
-    DVR's clock is often set wrong (measured ~4.8h off), so the app's saved
-    snapshots (host time) and the DVR's event times don't line up without it.
-    Cached ~5 min; returns 0.0 on any failure."""
+def _clock(cfg):
+    """(skew_secs, tzinfo) for a device.
+
+    A DVR timestamp is its own wall clock, and that clock drifts badly (~6h seen),
+    so it is NOT a real instant: real_epoch = dvr_wall_clock (read in `tzinfo`,
+    the offset the DVR itself reports) + `skew`. With that, event times can be sent
+    to the browser as real epochs and rendered in the VIEWER's timezone, instead of
+    showing the DVR's wrong local clock. Cached ~5 min; falls back to (0, local tz)
+    so a device that won't answer just behaves as before.
+    """
     host = cfg.get("host", "")
-    cached = _offset_cache.get(host)
+    cached = _clock_cache.get(host)
     if cached and cached[1] > time.monotonic():
         return cached[0]
-    off = 0.0
+    info = (0.0, datetime.now().astimezone().tzinfo)
     try:
         _, raw = camera.camera_get(cfg, "/ISAPI/System/time", timeout=8)
-        m = re.search(r"<localTime>(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})", raw.decode("utf-8", "replace"))
+        m = re.search(r"<localTime>([^<]+)</localTime>", raw.decode("utf-8", "replace"))
         if m:
-            off = (datetime.now() - datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")).total_seconds()
-    except Exception:  # noqa: BLE001 - offset just falls back to 0
+            dvr = datetime.fromisoformat(m.group(1).strip())
+            if dvr.tzinfo is None:   # no offset advertised -> assume this host's
+                dvr = dvr.replace(tzinfo=info[1])
+            info = (time.time() - dvr.timestamp(), dvr.tzinfo)
+    except Exception:  # noqa: BLE001 - an unreadable clock just means "no correction"
         pass
-    _offset_cache[host] = (off, time.monotonic() + 300)
-    return off
+    _clock_cache[host] = (info, time.monotonic() + 300)
+    return info
+
+
+def dvr_window(cfg, hours):
+    """(start_iso, end_iso) covering the last `hours` of REAL time, expressed in the
+    DVR's own drifting wall clock — the only clock CMSearch understands. Using the
+    host's clock here would search a window the DVR reads as hours off, silently
+    trimming the recording at one end."""
+    skew, tz = _clock(cfg)
+    now = datetime.fromtimestamp(time.time() - skew, tz)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    return (now - timedelta(hours=hours)).strftime(fmt), now.strftime(fmt)
+
+
+def _epoch(iso, skew, tz):
+    """DVR wall-clock ISO -> real UTC epoch seconds (None if unparseable)."""
+    try:
+        return int(datetime.fromisoformat(iso.replace("Z", "")).replace(tzinfo=tz).timestamp() + skew)
+    except ValueError:
+        return None
 
 SEARCH = "/ISAPI/ContentMgmt/search"
 # Audio is dropped (-an): this DVR records G.711/pcm_mulaw, which can't be
@@ -58,7 +85,7 @@ def _iso_to_rtsp(iso):
     return digits + "Z"
 
 
-def _cmsearch_body(track_id, start_iso, end_iso, max_results):
+def _cmsearch_body(track_id, start_iso, end_iso, max_results, position=0):
     # searchID must be a well-formed GUID or the DVR rejects it (400).
     return (
         '<CMSearchDescription><searchID>0FEEDEE0-0000-0000-0000-000000000001</searchID>'
@@ -66,7 +93,7 @@ def _cmsearch_body(track_id, start_iso, end_iso, max_results):
         f"<timeSpanList><timeSpan><startTime>{start_iso}</startTime>"
         f"<endTime>{end_iso}</endTime></timeSpan></timeSpanList>"
         f"<maxResults>{int(max_results)}</maxResults>"
-        "<searchResultPostion>0</searchResultPostion></CMSearchDescription>"
+        f"<searchResultPostion>{int(position)}</searchResultPostion></CMSearchDescription>"
     ).encode()
 
 
@@ -80,19 +107,48 @@ def _seconds(start_iso, end_iso):
         return 0
 
 
-def list_events(cfg, track_id, start_iso, end_iso, max_results=100):
-    """Return motion events for a track in [start_iso, end_iso], newest first:
-      [{time, seconds, start, end}] — `time` is the ISO start (DVR clock),
-      `start`/`end` are the RTSP-format bounds for /clip."""
-    _, raw = camera.camera_post(cfg, SEARCH, _cmsearch_body(track_id, start_iso, end_iso, max_results))
+PAGE_SIZE = 100  # per request; this DVR truncates to ~64 anyway and answers "MORE"
+
+
+def _page(cfg, track_id, start_iso, end_iso, limit, position):
+    """One CMSearch page -> (events, more?)."""
+    _, raw = camera.camera_post(cfg, SEARCH,
+                                _cmsearch_body(track_id, start_iso, end_iso, limit, position))
     text = raw.decode("utf-8", "replace")
     events = []
     for m in re.finditer(r"<startTime>([^<]+)</startTime>\s*<endTime>([^<]+)</endTime>", text):
         s, e = m.group(1), m.group(2)
         events.append({"time": s.replace("Z", ""), "seconds": _seconds(s, e),
                        "start": _iso_to_rtsp(s), "end": _iso_to_rtsp(e)})
+    status = re.search(r"<responseStatusStrg>([^<]*)</responseStatusStrg>", text)
+    return events, bool(status) and status.group(1).strip().upper() == "MORE"
+
+
+def list_events(cfg, track_id, start_iso, end_iso, max_results=500):
+    """Return motion events for a track in [start_iso, end_iso], newest first:
+      [{time, epoch, seconds, start, end}] — `time` is the ISO start (DVR clock,
+      what /playback and /clip want), `epoch` the same instant as real UTC seconds
+      so the browser can show it in the VIEWER's timezone, and `start`/`end` are the
+      RTSP-format bounds for /clip.
+
+    Paged: the DVR truncates one search to ~64 matches, flags `responseStatusStrg`
+    MORE, and returns the OLDEST matches first — so a single request silently drops
+    the NEWEST events (the log looked like it stopped hours ago). Keep asking with a
+    higher `searchResultPostion` until it stops saying MORE; `max_results` bounds a
+    device that always does."""
+    events, pos = [], 0
+    while len(events) < max_results:
+        page, more = _page(cfg, track_id, start_iso, end_iso,
+                           min(PAGE_SIZE, max_results - len(events)), pos)
+        events.extend(page)
+        if not page or not more:
+            break
+        pos += len(page)
+    skew, tz = _clock(cfg)
+    for ev in events:
+        ev["epoch"] = _epoch(ev["time"], skew, tz)
     events.sort(key=lambda ev: ev["start"], reverse=True)
-    return events
+    return events[:max_results]
 
 
 def clip_process(cfg, track_id, start, end):

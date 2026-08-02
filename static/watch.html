@@ -44,8 +44,16 @@ function clipUrl(dl) {
   return '/clip?device=' + encodeURIComponent(device) + '&ch=' + encodeURIComponent(ch) +
          '&start=' + encodeURIComponent(start) + '&end=' + encodeURIComponent(end) + (dl ? '&download=1' : '');
 }
-// '20260801T191559Z' -> '2026-08-01 19:15:59' (DVR wall clock; the trailing Z is a label, not UTC)
+// Prefer `t` — the event's real epoch, rendered in THIS viewer's timezone. The
+// `start` fallback is the DVR's own wall clock (trailing Z is a label, not UTC) and
+// that clock is usually hours off, so it is only used when the link carries no `t`.
 function pretty(t) {
+  const ep = Number(q.get('t')) || 0;
+  if (ep) {
+    const d = new Date(ep * 1000), p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+           `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
   const m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})/.exec(t || '');
   return m ? `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}` : (t || '');
 }

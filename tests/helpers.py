@@ -146,8 +146,12 @@ def time_xml(skew_secs=0, tz="+03:00"):
             f"<localTime>{stamp}</localTime><timeZone>CST-3:00:00</timeZone></Time>").encode()
 
 
-def cmsearch_result_xml(spans):
-    """A CMSearchResult with one motion match per (start_iso, end_iso) span."""
+def cmsearch_result_xml(spans, status="OK"):
+    """A CMSearchResult with one motion match per (start_iso, end_iso) span.
+
+    `status` is the DVR's `responseStatusStrg`: "MORE" means the result was
+    truncated and the rest must be fetched with a higher searchResultPostion.
+    """
     items = "".join(
         f"<searchMatchItem><trackID>101</trackID>"
         f"<timeSpan><startTime>{s}</startTime><endTime>{e}</endTime></timeSpan>"
@@ -158,6 +162,7 @@ def cmsearch_result_xml(spans):
         for s, e in spans
     )
     return (f'<CMSearchResult><searchID>x</searchID><responseStatus>true</responseStatus>'
+            f"<responseStatusStrg>{status}</responseStatusStrg>"
             f"<numOfMatches>{len(spans)}</numOfMatches><matchList>{items}</matchList>"
             f"</CMSearchResult>").encode()
 

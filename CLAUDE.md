@@ -288,11 +288,36 @@ or does not expose the feature at all.
   `camera.MAX_STILL_RES` (720p — this DVR's max still). Manual **Save** and motion
   auto-capture use the same path. The browser can't write arbitrary paths, so the
   path is a server setting, not a browser download.
+- **CMSearch is PAGED and the DVR hands back the OLDEST matches first.** One
+  `POST /ISAPI/ContentMgmt/search` returns at most **64** matches on this DVR (it
+  ignores a larger `maxResults`), sets `<responseStatusStrg>MORE</responseStatusStrg>`,
+  and fills the page from the **start** of the window. So a single request silently
+  drops the **newest** events — the event log looked like it "stopped hours ago"
+  (measured: 64 shown, newest 09:20 while 107 existed). `list_events` therefore loops
+  on **`<searchResultPostion>`** (`_page` + `PAGE_SIZE`) until the DVR stops saying
+  MORE, bounded by `max_results` (500) so a device that always says MORE can't spin.
+  `<numOfMatches>` is the count **in this page**, not the total — there is no
+  `totalMatches`, MORE is the only "there's more" signal.
+- **DVR clock ≠ real time, so event times are converted for the browser.** The DVR's
+  timestamps are its own wall clock, in its own zone, and that clock drifts badly
+  (measured **5h10m slow**, zone `+03:00`, while the host ran UTC+4) — so a fresh
+  event renders as "9 am" at 4 pm. `recordings._clock(cfg)` reads
+  `/ISAPI/System/time` (cached 5 min) and derives **`(skew, tzinfo)`**:
+  `real_epoch = dvr_wall_clock read in tzinfo + skew`. Two things use it:
+  **(1) `dvr_window(cfg, hours)`** builds the search window **in the DVR's clock**, so
+  "last 24h" is a real 24h (host-clock bounds asked the DVR for a window hours off,
+  trimming one end); **(2) every event carries `epoch`** (real UTC seconds) alongside
+  the raw `time`. **All times are rendered client-side in the VIEWER's timezone**
+  (`app.js localTime()`, `watch.html pretty()` via the share link's `&t=<epoch>`) —
+  never server-side, since the server (a UTC droplet) is not where the user is.
+  `time`/`start`/`end` stay **raw DVR clock** because `/playback` and `/clip` speak
+  only that. If the clock read fails, skew is 0 and behaviour is as before.
+  Fixing the drift itself is **Diagnose**'s job (`_set_clock`), not the event log's.
 - **Event log** (`recordings.py`, per-tile ⚙ → "Event log"): once the DVR records
   on **motion** (diagnose fix), each recorded segment IS a motion event.
   `list_events` runs `POST /ISAPI/ContentMgmt/search` (`CMSearchDescription`, a
   well-formed GUID `searchID` or it 400s) on the channel's track over the last N
-  hours and returns `{time, seconds, start, end}` per clip (newest first). The UI
+  hours and returns `{time, epoch, seconds, start, end}` per clip (newest first). The UI
   lists them; each row shows **ONE thumbnail grabbed live from the DVR recording** —
   a single `<img>` at `/playback?...&time=&res=480x270`, sampled ~12s in (just
   after the 10s pre-record, where the motion is), via `playback.grab_frame`
@@ -551,7 +576,7 @@ store.py                  # server-side snapshot saving to config save_path (sav
 diagnose.py               # per-device health check + safe auto-fix. Live channels: motion enabled/area, VMD email+center linkage, motion-rec 10s pre/post, max-res. Unused channels (NO VIDEO input or hidden tile): only "recording left on" -> disable track. Device-wide: SMTP + DVR clock (System/time) skew -> set correct local time
 live.py                   # RTSP->MJPEG via ffmpeg (Live view); rtsp_url (stored URL for kind=rtsp) + check + open_mjpeg + grab_still (one frame, for RTSP tiles/Save); -timeout so dead streams fail fast; SAR->square-pixel so streams aren't squished. ALSO the ffmpeg child registry: spawn/terminate/terminate_all (atexit) + kill_orphans — every ffmpeg in the app goes through spawn(), or a stranded one blocks the DVR's single RTSP session
 playback.py               # recorded playback: one still at a chosen time via RTSP tracks + ffmpeg; to_span + playback_url + grab_frame (serialized to 1 RTSP session, retries RTSP 453, in-memory frame cache) + rtsp_priority() (clip playback pauses grabs)
-recordings.py             # motion event log + clip video: list_events (CMSearch POST /ISAPI/ContentMgmt/search on the motion track) + clip_process (RTSP playback -> ffmpeg fragmented MP4, audio dropped)
+recordings.py             # motion event log + clip video: list_events (PAGED CMSearch POST /ISAPI/ContentMgmt/search on the motion track -- loops searchResultPostion while the DVR says MORE) + _clock/dvr_window/_epoch (DVR clock skew -> search window in DVR time, event `epoch` in real time for browser-local display) + clip_process (RTSP playback -> ffmpeg fragmented MP4, audio dropped)
 scan.py                   # rtsp-scan: windowed probe (window of --parallel IPs, port-major) + ONE shared budget of `workers` slots for probe+verify combined (a found port hands its slot from probing to verifying; total in-flight <= workers) — scan_and_verify + probe_rtsp + find_credential(_ex) + enumerate_streams (vendor+channel enumeration + credential/attempts/reason) + probe_streams (streams-only wrapper) + expand_range/expand_ranges + rtsp_link + device_entry
 vendors/                  # one module per camera/DVR family (Vendor: realm keywords + per-stream path groups + channel walk w/ early-stop). __init__.detect(realm)/enumeration_order(); add a device here, not in scan.py
 default_config.json       # USER-OWNED runtime input (devices=[], scan range/ports). Assistant: never read/edit. config.py reads it at runtime only.
@@ -599,9 +624,9 @@ the name up on the module at call time. Preserve this pattern.
 | POST | `/save` `{device,ch}` | save a max-res (720p) JPEG to `save_path`, returns `{ok,path}` |
 | POST | `/reboot` `{device}` | reboot the whole device (`PUT /ISAPI/System/reboot`); per-device, drops all streams ~1 min |
 | GET | `/playback?device=<id>&ch=<track>&time=<ISO>` | one max-res still from the recording at a time |
-| GET | `/events?device=<id>&ch=<track>&hours=<n>` | motion event log (CMSearch over the last n hours) → `{events:[{time,seconds,start,end}]}` |
+| GET | `/events?device=<id>&ch=<track>&hours=<n>` | motion event log (paged CMSearch over the last n hours of REAL time) → `{events:[{time,epoch,seconds,start,end}]}` — `time` is DVR clock, `epoch` the real instant (browser renders it in its own tz) |
 | GET | `/clip?device=<id>&ch=<track>&start=&end=` | one motion clip as MP4 (RTSP playback→ffmpeg, streamed) |
-| GET | `/watch?device=<id>&ch=&start=&end=` | **shared-link player page** (`static/watch.html`) — plays that one recording; the link holds NO credentials |
+| GET | `/watch?device=<id>&ch=&start=&end=&t=<epoch>` | **shared-link player page** (`static/watch.html`) — plays that one recording; the link holds NO credentials |
 | GET | `/watch/info?device=<id>` | camera **name only**, for the shared page's title |
 | GET | `/live/check?device=<id>` | pre-flight: ffmpeg present + RTSP port reachable |
 | GET | `/live?device=<id>&ch=<cid>&stream=main\|sub` | live MJPEG stream (RTSP→ffmpeg), runs until the browser disconnects |

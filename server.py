@@ -38,7 +38,7 @@ import sys
 import threading
 import urllib.error
 import webbrowser
-from datetime import datetime, timedelta
+from datetime import datetime
 from urllib.parse import parse_qs, unquote, urlparse
 
 import camera, config, diagnose, events, live, motion, playback, recordings, store, web
@@ -230,12 +230,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(404, "unknown device")
                 return
             hours = int(q.get("hours", "24") or "24")
-            now = datetime.now()  # DVR shares the local wall clock; labeled Z (not real UTC)
-            start = (now - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
             try:
-                # thumbnails are grabbed live from the DVR recording (via /playback);
-                # the event list itself is just times/durations.
+                # The window must be in the DVR's own (drifting) wall clock, not this
+                # host's — see recordings.dvr_window. Thumbnails are grabbed live from
+                # the DVR recording (via /playback); the list is just times/durations.
+                start, end = recordings.dvr_window(cfg, hours)
                 self._json(200, {"events": recordings.list_events(cfg, q.get("ch", "101"), start, end)})
             except Exception as e:  # noqa: BLE001
                 self._json(200, {"error": self._explain(e)})

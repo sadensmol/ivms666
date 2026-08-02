@@ -601,10 +601,11 @@ function openEventFrame(img) {
 // (immutable) -> instant; paging to a not-yet-loaded row sets the same /playback URL,
 // which grabs it from the DVR (a few seconds, one RTSP session at a time — see below).
 function showFrame(img) {
-  const t = img.dataset.t, base = 'Event frame · ' + t.replace('T', ' ');
+  const t = img.dataset.t;
+  const base = 'Event frame · ' + localTime(Number(img.dataset.epoch) || 0, t);
   // `start`/`end` are the event's clip span -> the ▶ Play button plays THIS event
   // (not live view); `time` is the still's instant, for ⬇ Download.
-  imgCtx = { deviceId: EV.d.id, chId: EV.ch.id, time: t,
+  imgCtx = { deviceId: EV.d.id, chId: EV.ch.id, time: t, epoch: Number(img.dataset.ep0) || 0,
              start: img.dataset.start, end: img.dataset.end };
   const big = $('imgBig');
   big.onload  = () => { $('imgTitle').textContent = base; };
@@ -653,9 +654,9 @@ function downloadFromImg() {
 // while an event frame PLAYS that recorded event (its clip), not live.
 function imgPlayOrLive() {
   if (!motCur && imgCtx && imgCtx.start && imgCtx.end) {   // event frame -> play the recorded event
-    const s = imgCtx.start, e = imgCtx.end;
+    const s = imgCtx.start, e = imgCtx.end, ep = imgCtx.epoch;
     closeImg();
-    playClip(s, e);
+    playClip(s, e, ep);
     return;
   }
   const c = motCur ? {deviceId:motCur.deviceId, chId:motCur.chId} : imgCtx;
@@ -695,7 +696,7 @@ function refreshMotionImg() {
 
 /* ---- event log: motion clips from the DVR's recordings ---- */
 const EV = { d:null, ch:null };
-const VID = { start:null, end:null };   // the clip currently in the player (for ⬇ Download)
+const VID = { start:null, end:null, epoch:0 };   // the clip currently in the player (for ⬇ Download)
 async function openEvents(d, id) {
   const ch=(chans[d.id]||[]).find(c=>c.id===id); if(!ch) return;
   EV.d=d; EV.ch=ch;
@@ -713,6 +714,16 @@ async function loadEvents() {
     renderEvents(r.events||[]);
   } catch(e){ $('evBody').innerHTML='<div class="chk bad">Error: '+escapeHtml(e.message)+'</div>'; }
 }
+// Event times are shown in the VIEWER's timezone. The DVR's own wall clock is both
+// in its own zone and usually wrong by hours, so the server sends `epoch` (the real
+// instant); `ev.time` stays the DVR clock because /playback and /clip speak that.
+function localTime(epoch, dvrIso) {
+  if (!epoch) return (dvrIso||'').replace('T',' ');   // clock unreadable -> raw DVR time
+  const d = new Date(epoch*1000);
+  const p = n => String(n).padStart(2,'0');
+  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+
+         p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+}
 function renderEvents(events) {
   if (!events.length) {
     $('evBody').innerHTML='<div class="diagsum">No motion events in this window.<br>'+
@@ -726,26 +737,28 @@ function renderEvents(events) {
     // the motion actually is. The DVR only allows one RTSP session at a time, so a
     // single lazy thumbnail per event is what loads reliably; click it to enlarge
     // (reuses the already-loaded image — instant, no second grab).
-    const t=addSecsIso(ev.time, Math.min(12, Math.round(ev.seconds*0.5)));
+    const off=Math.min(12, Math.round(ev.seconds*0.5));
+    const t=addSecsIso(ev.time, off);
     // `src` is set by the loader, NOT here: the DVR serves ~one RTSP session, so the
     // browser's usual 6 parallel image requests would queue behind the server's grab
     // lock and time out (that is what turned most rows into broken images).
     const thumb='<div class="evthumbs"><img class="evthumb" data-src="'+escapeHtml(dvrFrameUrl(t,'480x270'))+'" '+
              'data-t="'+escapeHtml(t)+'" data-start="'+escapeHtml(ev.start)+'" data-end="'+escapeHtml(ev.end)+'" '+
+             'data-epoch="'+(ev.epoch ? ev.epoch+off : '')+'" data-ep0="'+(ev.epoch||'')+'" '+
              'alt=""><span class="evwait">…</span></div>';
-    html+='<div class="evrow"><div class="evmeta"><span class="evtime">'+escapeHtml(ev.time.replace('T',' '))+'</span>'+
+    html+='<div class="evrow"><div class="evmeta"><span class="evtime">'+escapeHtml(localTime(ev.epoch, ev.time))+'</span>'+
           '<span class="evdur">'+ev.seconds+'s</span></div>'+
           thumb+
-          '<button class="iconbtn" data-play="'+escapeHtml(ev.start+'|'+ev.end)+'">▶ Play</button>'+
+          '<button class="iconbtn" data-play="'+escapeHtml(ev.start+'|'+ev.end+'|'+(ev.epoch||0))+'">▶ Play</button>'+
           '<button class="iconbtn" data-dl="'+escapeHtml(ev.start+'|'+ev.end)+'" '+
           'title="Download this clip (the recording\'s own resolution)">⬇</button>'+
-          '<button class="iconbtn" data-share="'+escapeHtml(ev.start+'|'+ev.end)+'" '+
+          '<button class="iconbtn" data-share="'+escapeHtml(ev.start+'|'+ev.end+'|'+(ev.epoch||0))+'" '+
           'title="Copy a link that plays this recording (no credentials in the link)">🔗</button></div>';
   }
   $('evBody').innerHTML=html;
-  $('evBody').querySelectorAll('[data-play]').forEach(b=>b.onclick=()=>{ const [s,e]=b.dataset.play.split('|'); playClip(s,e); });
+  $('evBody').querySelectorAll('[data-play]').forEach(b=>b.onclick=()=>{ const [s,e,ep]=b.dataset.play.split('|'); playClip(s,e,ep); });
   $('evBody').querySelectorAll('[data-dl]').forEach(b=>b.onclick=()=>{ const [s,e]=b.dataset.dl.split('|'); downloadClip(s,e); });
-  $('evBody').querySelectorAll('[data-share]').forEach(b=>b.onclick=()=>{ const [s,e]=b.dataset.share.split('|'); shareClip(b,s,e); });
+  $('evBody').querySelectorAll('[data-share]').forEach(b=>b.onclick=()=>{ const [s,e,ep]=b.dataset.share.split('|'); shareClip(b,s,e,ep); });
   // click a thumbnail -> enlarge the SAME already-loaded image (instant, cached in
   // the browser). A broken/never-loaded thumbnail has nothing to show, so skip it.
   $('evBody').querySelectorAll('.evthumb').forEach(img=>{
@@ -820,12 +833,15 @@ function downloadClip(start, end) {
    server resolves the camera from ~/.ivms666.json when the page asks for the clip.
    Whoever opens it still has to pass Cloudflare Access first (that is the app's
    only authentication — see CLAUDE.md → Deployment). */
-function shareUrl(start, end) {
+// `t` is the event's real epoch, so the shared page can print the time in ITS
+// viewer's timezone instead of the DVR's (wrong, foreign-zone) wall clock.
+function shareUrl(start, end, epoch) {
   return location.origin+'/watch?device='+encodeURIComponent(EV.d.id)+'&ch='+encodeURIComponent(EV.ch.id)+
-         '&start='+encodeURIComponent(start)+'&end='+encodeURIComponent(end);
+         '&start='+encodeURIComponent(start)+'&end='+encodeURIComponent(end)+
+         (epoch ? '&t='+encodeURIComponent(epoch) : '');
 }
-async function shareClip(btn, start, end) {
-  const url=shareUrl(start, end);
+async function shareClip(btn, start, end, epoch) {
+  const url=shareUrl(start, end, epoch);
   const done=t=>{ const old=btn.textContent; btn.textContent=t; setTimeout(()=>btn.textContent=old, 1800); };
   try {
     await navigator.clipboard.writeText(url);   // needs https / localhost
@@ -834,10 +850,10 @@ async function shareClip(btn, start, end) {
     window.prompt('Copy this link:', url);      // clipboard blocked -> let the user copy it
   }
 }
-function playClip(start, end) {
+function playClip(start, end, epoch) {
   const v=$('vidPlayer');
   pauseThumbs();   // give the clip the DVR's single RTSP session (stop thumbnail grabs)
-  VID.start=start; VID.end=end;
+  VID.start=start; VID.end=end; VID.epoch=epoch||0;
   $('vidTitle').textContent='Playback — '+(EV.d.name||EV.d.host)+' / '+EV.ch.name;
   $('vidMsg').textContent='Loading… (transcoding the clip from the DVR)';
   v.src=clipUrl(start, end);
@@ -1130,7 +1146,7 @@ $('evClose').onclick=()=>{ thumbQ=[]; thumbBusy=null; $('evOverlay').classList.r
 $('evHours').onchange=loadEvents;
 $('vidClose').onclick=closeVid;
 $('vidDownload').onclick=()=>{ if (VID.start) downloadClip(VID.start, VID.end); };
-$('vidShare').onclick=()=>{ if (VID.start) shareClip($('vidShare'), VID.start, VID.end); };  // same /watch link as the row 🔗
+$('vidShare').onclick=()=>{ if (VID.start) shareClip($('vidShare'), VID.start, VID.end, VID.epoch); };  // same /watch link as the row 🔗
 $('vidSpeed').onchange=()=>{ $('vidPlayer').playbackRate=parseFloat($('vidSpeed').value)||1; };
 $('imgClose').onclick=closeImg;
 $('imgDownload').onclick=downloadFromImg;
