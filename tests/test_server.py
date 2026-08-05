@@ -462,6 +462,26 @@ class ServerTest(unittest.TestCase):
         finally:
             recordings.ffmpeg_available, recordings.clip_process = orig_av, orig_proc
 
+    def test_clip_while_another_plays_fails_fast(self):
+        """A clip requested while one is playing must answer 503, not hang: the old
+        unbounded wait made the ⬇ Download button look dead and then delivered every
+        queued file at once when the player closed."""
+        _, dev = self.add_device()
+        orig_av, orig_proc = recordings.ffmpeg_available, recordings.clip_process
+        orig_wait = server._CLIP_SESSION_WAIT
+        recordings.ffmpeg_available = lambda: True
+        recordings.clip_process = lambda cfg, ch, start, end: FakeProc(b"MP4CLIPDATA")  # noqa
+        server._CLIP_SESSION_WAIT = 0.2
+        try:
+            with playback.rtsp_priority():   # stands in for the browser's open <video>
+                st, b = self.req("GET", f"/clip?device={dev['id']}&ch=101"
+                                        "&start=20260726T080134Z&end=20260726T080151Z&download=1")
+            self.assertEqual(st, 503)
+            self.assertIn(b"busy", b.lower())
+        finally:
+            server._CLIP_SESSION_WAIT = orig_wait
+            recordings.ffmpeg_available, recordings.clip_process = orig_av, orig_proc
+
     def test_playback_download_sends_attachment_filename(self):
         _, dev = self.add_device()
         orig_av, orig_grab = live.ffmpeg_available, playback.grab_frame

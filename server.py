@@ -45,6 +45,11 @@ import camera, config, diagnose, events, live, motion, playback, recordings, sto
 
 _LIVE_FIRST_READ = 512   # bytes to wait for before declaring the stream alive
 _LIVE_CHUNK = 8192
+# How long a clip request waits for the DVR's single RTSP session before answering
+# "busy". Long enough for a just-closed player's handler to notice the hang-up and
+# let go (it only finds out on its next write), short enough that the caller gets
+# an answer rather than an invisible queue.
+_CLIP_SESSION_WAIT = 15
 
 
 def _safe_name(text, fallback="camera"):
@@ -322,38 +327,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not recordings.ffmpeg_available():
             self._send(503, "ffmpeg is not installed on the server (e.g. `brew install ffmpeg`)")
             return
-        q = self._query()
         # Clip playback gets priority over event-log thumbnail grabs — the DVR only
         # serves ~one RTSP session, so this pauses grabs for the clip's duration.
-        with playback.rtsp_priority():
-            proc = recordings.clip_process(cfg, q.get("ch", "101"), q.get("start", ""), q.get("end", ""))
-            first = proc.stdout.read(_LIVE_FIRST_READ)
-            if not first:  # ffmpeg produced nothing -> no footage / RTSP unreachable
-                err = (proc.stderr.read() or b"").decode("utf-8", "replace").strip()[:300]
-                recordings.terminate(proc)
-                self._send(502, "clip failed: " + (err or "no recording for that time, or RTSP port unreachable"))
-                return
-            threading.Thread(target=lambda: proc.stderr.read(), daemon=True).start()
-            # `&download=1` -> the browser saves the file instead of playing it. The
-            # clip is already the recording's own H.264 stream-copied (`-c:v copy`),
-            # i.e. the DVR's highest resolution — there is no re-encode to lose.
-            extra = {}
-            if q.get("download"):
-                extra["Content-Disposition"] = \
-                    f'attachment; filename="{_clip_filename(q.get("device", ""), q)}"'
-            self._stream_start("video/mp4", extra)
-            try:
-                self._stream_write(first)
-                while True:
-                    chunk = proc.stdout.read(_LIVE_CHUNK)
-                    if not chunk:
-                        break
-                    self._stream_write(chunk)
-                self._stream_end()
-            except (BrokenPipeError, ConnectionResetError):
-                pass  # browser closed the player
-            finally:
-                recordings.terminate(proc)
+        # A clip asked for while another one is still streaming waits only briefly
+        # (the previous stream's handler needs a moment to notice its browser hung
+        # up) and then says so — an unbounded wait used to leave ⬇ Download with no
+        # response at all until the player closed, and then start the transfer
+        # nobody was waiting for any more.
+        try:
+            with playback.rtsp_priority(timeout=_CLIP_SESSION_WAIT):
+                self._stream_clip(cfg)
+        except playback.Busy:
+            self._send(503, "DVR busy: another clip is playing (the DVR serves one stream at a time)")
+
+    def _stream_clip(self, cfg):
+        """The clip body, holding the DVR's RTSP session (see `_handle_clip`)."""
+        q = self._query()
+        proc = recordings.clip_process(cfg, q.get("ch", "101"), q.get("start", ""), q.get("end", ""))
+        first = proc.stdout.read(_LIVE_FIRST_READ)
+        if not first:  # ffmpeg produced nothing -> no footage / RTSP unreachable
+            err = (proc.stderr.read() or b"").decode("utf-8", "replace").strip()[:300]
+            recordings.terminate(proc)
+            self._send(502, "clip failed: " + (err or "no recording for that time, or RTSP port unreachable"))
+            return
+        threading.Thread(target=lambda: proc.stderr.read(), daemon=True).start()
+        # `&download=1` -> the browser saves the file instead of playing it. The
+        # clip is already the recording's own H.264 stream-copied (`-c:v copy`),
+        # i.e. the DVR's highest resolution — there is no re-encode to lose.
+        extra = {}
+        if q.get("download"):
+            extra["Content-Disposition"] = \
+                f'attachment; filename="{_clip_filename(q.get("device", ""), q)}"'
+        self._stream_start("video/mp4", extra)
+        try:
+            self._stream_write(first)
+            while True:
+                chunk = proc.stdout.read(_LIVE_CHUNK)
+                if not chunk:
+                    break
+                self._stream_write(chunk)
+            self._stream_end()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # browser closed the player
+        finally:
+            recordings.terminate(proc)
 
     def _handle_playback(self, cfg):
         """Grab one full-res still from the recording at the requested time."""

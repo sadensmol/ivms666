@@ -113,6 +113,20 @@ class GrabFrameTest(unittest.TestCase):
             self.assertEqual(after, JPEG)
         self.assertEqual(len(calls), 1)                    # only the post-release grab ran
 
+    def test_second_clip_gives_up_instead_of_blocking(self):
+        # The DVR serves ~one RTSP session, so a second clip cannot start while one
+        # plays — but it must FAIL FAST, not sit in acquire() forever (an invisible
+        # queue that fires every pending download the moment the player closes).
+        with playback.rtsp_priority():
+            t0 = time.time()
+            with self.assertRaises(playback.Busy):
+                with playback.rtsp_priority(timeout=0.2):
+                    self.fail("must not get the session while a clip holds it")
+            self.assertLess(time.time() - t0, 5)
+        self.assertEqual(playback._playback_active, 0)  # the refused enter left no residue
+        with playback.rtsp_priority(timeout=0.2):       # released -> next clip gets it
+            pass
+
     def test_grabs_run_one_at_a_time(self):
         concurrent = []
         peak = [0]

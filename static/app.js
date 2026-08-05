@@ -862,10 +862,29 @@ function playClip(start, end, epoch) {
   v.onloadeddata=()=>{ $('vidMsg').textContent=''; v.playbackRate=parseFloat($('vidSpeed').value)||1; v.play().catch(()=>{}); };
   v.onerror=()=>{ $('vidMsg').textContent='⚠ could not play (DVR playback unreachable, or ffmpeg missing).'; };
 }
+// Dropping the <video>'s src closes the browser's /clip connection, which is what
+// makes the server-side ffmpeg exit and hands the DVR's single RTSP session back.
+function stopVidStream() {
+  const v=$('vidPlayer'); v.pause(); v.removeAttribute('src'); v.load();
+}
 function closeVid() {
-  const v=$('vidPlayer'); v.pause(); v.removeAttribute('src'); v.load();  // stops the server-side ffmpeg
+  stopVidStream();
   $('vidOverlay').classList.remove('open');
   resumeThumbs();  // clip done -> let the event-log thumbnails finish loading
+}
+/* ⬇ Download inside the player. The clip on screen IS the DVR's one RTSP session,
+   so the download needs that session back: stop the stream first, then save. Asking
+   for the file on top of the playing stream used to queue behind it server-side —
+   no file, no error, and then every pending download landing at once the moment the
+   player was closed. */
+function downloadPlayingClip() {
+  if (!VID.start) return;
+  const s=VID.start, e=VID.end, ep=VID.epoch;
+  stopVidStream();
+  $('vidMsg').innerHTML='Playback stopped — downloading the clip (the DVR serves one stream at a time). ' +
+                        '<button class="linkbtn" id="vidReplay">▶ Play again</button>';
+  $('vidReplay').onclick=()=>playClip(s, e, ep);
+  downloadClip(s, e);
 }
 // While a clip plays it owns the DVR's one RTSP session: stop the loader and put
 // the in-flight thumbnail back at the FRONT of the queue, so it resumes first when
@@ -1145,7 +1164,7 @@ $('diagFix').onclick=fixDiag;
 $('evClose').onclick=()=>{ thumbQ=[]; thumbBusy=null; $('evOverlay').classList.remove('open'); };
 $('evHours').onchange=loadEvents;
 $('vidClose').onclick=closeVid;
-$('vidDownload').onclick=()=>{ if (VID.start) downloadClip(VID.start, VID.end); };
+$('vidDownload').onclick=downloadPlayingClip;   // frees the RTSP session first (see the fn)
 $('vidShare').onclick=()=>{ if (VID.start) shareClip($('vidShare'), VID.start, VID.end, VID.epoch); };  // same /watch link as the row 🔗
 $('vidSpeed').onchange=()=>{ $('vidPlayer').playbackRate=parseFloat($('vidSpeed').value)||1; };
 $('imgClose').onclick=closeImg;

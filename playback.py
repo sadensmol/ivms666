@@ -37,17 +37,35 @@ _playback_active = 0
 _playback_lock = threading.Lock()
 
 
+class Busy(Exception):
+    """The DVR's single RTSP session is already taken by another clip."""
+
+
 class rtsp_priority:
     """Context manager for a long-lived RTSP stream (clip playback). Claims the
     DVR's single session for its whole duration: new thumbnail grabs stand down,
     and any in-flight grab is drained first. Enter before starting the stream, exit
-    when it ends."""
+    when it ends.
+
+    `timeout` bounds the wait and raises `Busy` instead. Waiting forever is wrong
+    here because the session is held for a whole CLIP, not for one grab: a second
+    clip request (the ⬇ Download button pressed mid-playback) would hang with no
+    response at all, then complete — unasked — when the player finally closed."""
+
+    def __init__(self, timeout=None):
+        self._timeout = timeout
 
     def __enter__(self):
         global _playback_active
+        # count first, so grabs stand down while we are still draining the in-flight one
         with _playback_lock:
             _playback_active += 1
-        _grab_sem.acquire()   # wait out any in-flight grab, then hold exclusivity
+        got = (_grab_sem.acquire(timeout=self._timeout) if self._timeout is not None
+               else _grab_sem.acquire())
+        if not got:
+            with _playback_lock:
+                _playback_active -= 1   # never entered -> __exit__ won't run, undo it here
+            raise Busy("another clip is using the DVR's RTSP session")
         return self
 
     def __exit__(self, *exc):

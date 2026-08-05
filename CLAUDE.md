@@ -21,6 +21,16 @@ Guidance for working in this repo. Read before editing.
 > comma-separated string is still accepted); that is fine. Only the assistant is
 > barred from reading/writing the file.
 
+> **HARD RULE — never put a real secret in the repository.** No password, no
+> credential, no API/tunnel token, no device IP/host/port, no RTSP URL with
+> userinfo — not in source, tests, fixtures, comments, docs, commit messages, or
+> this file. Real values live **only** outside the repo: `~/.ivms666.json` (0600),
+> the user-owned `default_config.json`, or the droplet's `/opt/ivms666/.env`.
+> In anything committed use obvious placeholders (`admin`/`secret`, `1.1.1.1`,
+> `rtsp://user:pass@host:554/…`). This applies to *learned* facts too: when
+> recording a hard-won device fact here, write the behaviour, never the address
+> or the login that produced it.
+
 > **Keep this file current.** Whenever you discover something new about the
 > device or codebase, hit a gotcha, or make an architectural decision, update
 > the relevant section of this file **in the same change**. Especially record
@@ -348,6 +358,19 @@ or does not expose the feature at all.
   on ▶ Play (`pauseThumbs` — the in-flight row goes back to the FRONT of the queue)
   and **resumes** it on close (`resumeThumbs`); closing the log clears the queue
   entirely, so no thumbnail requests the DVR while a clip plays or after you leave.
+  **⬇ Download in the player STOPS playback first** (`downloadPlayingClip` →
+  `stopVidStream` → `downloadClip`, then a "Playback stopped — downloading the clip"
+  note with a **▶ Play again** button). It has to: the clip on screen *is* the DVR's
+  one RTSP session, so asking for `/clip?…&download=1` on top of it used to block in
+  `rtsp_priority.__enter__`'s **unbounded** `_grab_sem.acquire()` for the whole
+  playback — the button looked dead, and then every queued download landed at once
+  the moment the player closed (reported as "I now have 2 items downloaded").
+  Server-side backstop: `rtsp_priority(timeout=…)` raises **`playback.Busy`** and
+  `_handle_clip` answers **503 "DVR busy: another clip is playing"** instead of
+  hanging (`server._CLIP_SESSION_WAIT`, 15s — long enough for the just-closed
+  player's handler to notice the hang-up, which it only does on its next write).
+  **Never restore an unbounded wait there** — a clip holds the session for minutes,
+  not for one grab.
   **Per-row actions: `▶ Play | ⬇ | 🔗`.** `⬇` downloads the clip
   (`/clip?…&download=1` → `Content-Disposition: attachment`) — it is `-c:v copy`,
   so the download IS the recording's own resolution, nothing is re-encoded. `🔗`
@@ -575,7 +598,7 @@ events.py                 # motion ALERT stream: per-device daemon watches /ISAP
 store.py                  # server-side snapshot saving to config save_path (save_snapshot = ISAPI still; save_bytes = pre-grabbed bytes, used for RTSP)
 diagnose.py               # per-device health check + safe auto-fix. Live channels: motion enabled/area, VMD email+center linkage, motion-rec 10s pre/post, max-res. Unused channels (NO VIDEO input or hidden tile): only "recording left on" -> disable track. Device-wide: SMTP + DVR clock (System/time) skew -> set correct local time
 live.py                   # RTSP->MJPEG via ffmpeg (Live view); rtsp_url (stored URL for kind=rtsp) + check + open_mjpeg + grab_still (one frame, for RTSP tiles/Save); -timeout so dead streams fail fast; SAR->square-pixel so streams aren't squished. ALSO the ffmpeg child registry: spawn/terminate/terminate_all (atexit) + kill_orphans — every ffmpeg in the app goes through spawn(), or a stranded one blocks the DVR's single RTSP session
-playback.py               # recorded playback: one still at a chosen time via RTSP tracks + ffmpeg; to_span + playback_url + grab_frame (serialized to 1 RTSP session, retries RTSP 453, in-memory frame cache) + rtsp_priority() (clip playback pauses grabs)
+playback.py               # recorded playback: one still at a chosen time via RTSP tracks + ffmpeg; to_span + playback_url + grab_frame (serialized to 1 RTSP session, retries RTSP 453, in-memory frame cache) + rtsp_priority(timeout=) (clip playback pauses grabs; raises Busy instead of waiting forever for a second clip)
 recordings.py             # motion event log + clip video: list_events (PAGED CMSearch POST /ISAPI/ContentMgmt/search on the motion track -- loops searchResultPostion while the DVR says MORE) + _clock/dvr_window/_epoch (DVR clock skew -> search window in DVR time, event `epoch` in real time for browser-local display) + clip_process (RTSP playback -> ffmpeg fragmented MP4, audio dropped)
 scan.py                   # rtsp-scan: windowed probe (window of --parallel IPs, port-major) + ONE shared budget of `workers` slots for probe+verify combined (a found port hands its slot from probing to verifying; total in-flight <= workers) — scan_and_verify + probe_rtsp + find_credential(_ex) + enumerate_streams (vendor+channel enumeration + credential/attempts/reason) + probe_streams (streams-only wrapper) + expand_range/expand_ranges + rtsp_link + device_entry
 vendors/                  # one module per camera/DVR family (Vendor: realm keywords + per-stream path groups + channel walk w/ early-stop). __init__.detect(realm)/enumeration_order(); add a device here, not in scan.py
