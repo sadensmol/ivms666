@@ -333,7 +333,13 @@ or does not expose the feature at all.
   after the 10s pre-record, where the motion is), via `playback.grab_frame`
   (width-scaled). **One, not three:** this DVR allows only ~one concurrent RTSP
   session (see the 453 gotcha), so 3 thumbs/event × several rows all 453'd — one
-  reliable thumb beats three broken ones. **The rows load STRICTLY ONE AT A TIME,
+  reliable thumb beats three broken ones. **Rows are cards in a `.evgrid`**
+  (`repeat(auto-fill, minmax(400px,1fr))` — several per line, since the modal is up to
+  1100px wide and a single-column list left most of it empty): a **212×120 thumbnail**
+  (2× the old 106×60; the grab stays `480x270`, so no extra DVR cost) on the left, and
+  beside it start→end clock time, the weekday/date, `duration · N min ago`
+  (`localParts`/`fmtDur`/`ago`), then the `▶ Play | ⬇ | 🔗` row. The thumb box is
+  **fixed-size** so cards don't jump as frames trickle in seconds apart. **The rows load STRICTLY ONE AT A TIME,
   client-side** (`app.js`: `thumbQ`/`pumpThumbs`/`thumbFailed`): the `<img>` carries
   the URL in `data-src` and the loader sets `src` only when it is that row's turn.
   Browser-native `loading="lazy"` was NOT enough — the browser still fires ~6

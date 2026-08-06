@@ -724,13 +724,35 @@ function localTime(epoch, dvrIso) {
   return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+
          p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
 }
+// Same instant, split for the event card: clock time, when it ended, and the day.
+function localParts(epoch, dvrIso, seconds) {
+  if (!epoch) return {time:(dvrIso||'').replace('T',' '), end:'', date:'DVR clock — not converted'};
+  const p=n=>String(n).padStart(2,'0');
+  const clock=e=>{ const d=new Date(e*1000); return p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds()); };
+  const d=new Date(epoch*1000);
+  return {time: clock(epoch), end: clock(epoch+(seconds||0)),
+          date: d.toLocaleDateString(undefined, {weekday:'short', day:'2-digit', month:'short', year:'numeric'})};
+}
+function fmtDur(s) {
+  s=Math.max(0, Math.round(s||0));
+  return s<60 ? s+'s' : Math.floor(s/60)+'m '+String(s%60).padStart(2,'0')+'s';
+}
+function ago(epoch) {
+  if (!epoch) return '';
+  const s=Math.max(0, Math.round(Date.now()/1000-epoch));
+  if (s<60) return 'just now';
+  if (s<3600) return Math.floor(s/60)+' min ago';
+  if (s<86400) return Math.floor(s/3600)+' h ago';
+  return Math.floor(s/86400)+' d ago';
+}
 function renderEvents(events) {
   if (!events.length) {
     $('evBody').innerHTML='<div class="diagsum">No motion events in this window.<br>'+
       '<small style="color:#9aa3af">If it stays empty, the DVR isn\'t recording on motion — open <b>Diagnose</b> and Fix.</small></div>';
     return;
   }
-  let html='<div class="diagsum">'+events.length+' motion event(s) · thumbnails load from the DVR recording (one at a time, a few seconds each):</div>';
+  let html='<div class="diagsum">'+events.length+' motion event(s) · thumbnails load from the DVR recording (one at a time, a few seconds each):</div>'+
+           '<div class="evgrid">';
   thumbQ=[]; thumbBusy=null;   // a re-render invalidates the previous queue
   for (const ev of events) {
     // ONE frame pulled live from the DVR, from just after the ~10s pre-record where
@@ -746,16 +768,24 @@ function renderEvents(events) {
              'data-t="'+escapeHtml(t)+'" data-start="'+escapeHtml(ev.start)+'" data-end="'+escapeHtml(ev.end)+'" '+
              'data-epoch="'+(ev.epoch ? ev.epoch+off : '')+'" data-ep0="'+(ev.epoch||'')+'" '+
              'alt=""><span class="evwait">…</span></div>';
-    html+='<div class="evrow"><div class="evmeta"><span class="evtime">'+escapeHtml(localTime(ev.epoch, ev.time))+'</span>'+
-          '<span class="evdur">'+ev.seconds+'s</span></div>'+
+    // frame left, everything else stacked beside it: the taller thumbnail would
+    // otherwise leave a band of empty space where the one-line meta used to sit.
+    const when=localParts(ev.epoch, ev.time, ev.seconds);
+    html+='<div class="evrow">'+
           thumb+
+          '<div class="evinfo">'+
+          '<div><div class="evtime">'+escapeHtml(when.time)+(when.end?' → '+escapeHtml(when.end):'')+'</div>'+
+          '<div class="evdate">'+escapeHtml(when.date)+'</div>'+
+          '<div class="evdur">'+escapeHtml(fmtDur(ev.seconds)+(ev.epoch?' · '+ago(ev.epoch):''))+'</div></div>'+
+          '<div class="evacts">'+
           '<button class="iconbtn" data-play="'+escapeHtml(ev.start+'|'+ev.end+'|'+(ev.epoch||0))+'">▶ Play</button>'+
           '<button class="iconbtn" data-dl="'+escapeHtml(ev.start+'|'+ev.end)+'" '+
           'title="Download this clip (the recording\'s own resolution)">⬇</button>'+
           '<button class="iconbtn" data-share="'+escapeHtml(ev.start+'|'+ev.end+'|'+(ev.epoch||0))+'" '+
-          'title="Copy a link that plays this recording (no credentials in the link)">🔗</button></div>';
+          'title="Copy a link that plays this recording (no credentials in the link)">🔗</button>'+
+          '</div></div></div>';
   }
-  $('evBody').innerHTML=html;
+  $('evBody').innerHTML=html+'</div>';
   $('evBody').querySelectorAll('[data-play]').forEach(b=>b.onclick=()=>{ const [s,e,ep]=b.dataset.play.split('|'); playClip(s,e,ep); });
   $('evBody').querySelectorAll('[data-dl]').forEach(b=>b.onclick=()=>{ const [s,e]=b.dataset.dl.split('|'); downloadClip(s,e); });
   $('evBody').querySelectorAll('[data-share]').forEach(b=>b.onclick=()=>{ const [s,e,ep]=b.dataset.share.split('|'); shareClip(b,s,e,ep); });
