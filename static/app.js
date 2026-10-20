@@ -704,12 +704,31 @@ async function openEvents(d, id) {
   $('evOverlay').classList.add('open');
   loadEvents();
 }
+// The From/To pickers are the one search window (viewer's local time); a quick
+// range just fills them. A relative preset is re-applied on every load, so its
+// "now" end is current rather than when the log was first opened.
+function toLocalInput(d) {
+  const p=n=>String(n).padStart(2,'0');
+  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':'+p(d.getMinutes());
+}
+function applyEvPreset(v) {
+  const now=new Date(); let from=new Date(now), to=now;
+  if (v==='today') from.setHours(0,0,0,0);
+  else if (v==='yesterday') { to=new Date(now); to.setHours(0,0,0,0); from=new Date(to); from.setDate(from.getDate()-1); }
+  else from=new Date(now.getTime()-(+v)*3600e3);
+  $('evFrom').value=toLocalInput(from); $('evTo').value=toLocalInput(to);
+}
 async function loadEvents() {
   if(!EV.d) return;
+  if ($('evQuick').value!=='custom') applyEvPreset($('evQuick').value);
+  const from=new Date($('evFrom').value), to=new Date($('evTo').value);   // no offset -> parsed as local
+  if (isNaN(from) || isNaN(to) || from>=to) {
+    $('evBody').innerHTML='<div class="chk bad">Pick a From time earlier than the To time.</div>'; return;
+  }
   $('evBody').innerHTML='<div class="diagsum">Loading motion events…</div>';
   try {
     const r=await jfetch('/events?device='+encodeURIComponent(EV.d.id)+'&ch='+encodeURIComponent(EV.ch.id)+
-                         '&hours='+encodeURIComponent($('evHours').value||'24'));
+                         '&from='+Math.floor(from/1000)+'&to='+Math.floor(to/1000));
     if (r.error) { $('evBody').innerHTML='<div class="chk bad">Error: '+escapeHtml(r.error)+'</div>'; return; }
     renderEvents(r.events||[]);
   } catch(e){ $('evBody').innerHTML='<div class="chk bad">Error: '+escapeHtml(e.message)+'</div>'; }
@@ -1192,7 +1211,9 @@ $('diagFix').onclick=fixDiag;
 // closing the log must also stop the loader — a queue left running keeps opening
 // RTSP sessions on the DVR for thumbnails nobody is looking at
 $('evClose').onclick=()=>{ thumbQ=[]; thumbBusy=null; $('evOverlay').classList.remove('open'); };
-$('evHours').onchange=loadEvents;
+$('evQuick').onchange=()=>{ if ($('evQuick').value!=='custom') loadEvents(); };
+$('evFrom').oninput=$('evTo').oninput=()=>{ $('evQuick').value='custom'; };
+$('evSearch').onclick=loadEvents;
 $('vidClose').onclick=closeVid;
 $('vidDownload').onclick=downloadPlayingClip;   // frees the RTSP session first (see the fn)
 $('vidShare').onclick=()=>{ if (VID.start) shareClip($('vidShare'), VID.start, VID.end, VID.epoch); };  // same /watch link as the row 🔗

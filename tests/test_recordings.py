@@ -85,6 +85,18 @@ class RecordingsTest(unittest.TestCase):
         self.assertAlmostEqual((real_now - dvr_end).total_seconds(), 7200, delta=30)
         self.assertEqual(_span_hours(start, end), 1)
 
+    def test_dvr_span_maps_a_picked_real_range_into_the_dvr_clock(self):
+        # A From/To picked in the browser (real epochs) must land 2h earlier on a
+        # DVR that runs 2h slow, in the DVR's own +03:00 wall clock.
+        recordings._clock_cache.clear()
+        tz = timezone(timedelta(hours=3))
+        frm = datetime(2026, 7, 26, 9, 0, tzinfo=tz).timestamp()
+        with FakeCamera(lambda m, p, b: ("application/xml", time_xml(skew_secs=-7200))):
+            start, end = recordings.dvr_span({"host": "skewed3", "port": "80"}, frm, frm + 3600)
+        parse = lambda s: datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=tz).timestamp()
+        self.assertAlmostEqual(parse(start), frm - 7200, delta=5)
+        self.assertAlmostEqual(parse(end), frm - 3600, delta=5)
+
     def test_list_events_reports_the_real_instant_as_epoch(self):
         # `time` stays the DVR clock (playback/clip speak it); `epoch` is the real
         # instant so the browser can render it in the VIEWER's timezone.

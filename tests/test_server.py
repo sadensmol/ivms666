@@ -435,6 +435,15 @@ class ServerTest(unittest.TestCase):
         st2, _ = self.req("GET", "/events?device=nope")
         self.assertEqual(st2, 404)
 
+    def test_events_route_accepts_a_from_to_range(self):
+        _, dev = self.add_device()
+        st, b = self.req("GET", f"/events?device={dev['id']}&ch=101&from=1785000000&to=1785086400")
+        self.assertEqual(st, 200)
+        self.assertEqual(len(json.loads(b)["events"]), 1)
+        for bad in ("from=200&to=100", "from=x&to=100", "hours=x"):
+            st, _ = self.req("GET", f"/events?device={dev['id']}&ch=101&{bad}")
+            self.assertEqual(st, 400, bad)
+
     def test_clip_streams_mp4(self):
         _, dev = self.add_device()
         orig_av, orig_proc = recordings.ffmpeg_available, recordings.clip_process

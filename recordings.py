@@ -12,7 +12,7 @@ playback URL wants `20260726T080134Z`.
 
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import camera, live, playback
 
@@ -53,10 +53,16 @@ def dvr_window(cfg, hours):
     DVR's own drifting wall clock — the only clock CMSearch understands. Using the
     host's clock here would search a window the DVR reads as hours off, silently
     trimming the recording at one end."""
+    now = time.time()
+    return dvr_span(cfg, now - hours * 3600, now)
+
+
+def dvr_span(cfg, from_epoch, to_epoch):
+    """(start_iso, end_iso) for a REAL-time range (UTC epochs, as the browser's
+    date picker sends them) expressed in the DVR's own drifting wall clock."""
     skew, tz = _clock(cfg)
-    now = datetime.fromtimestamp(time.time() - skew, tz)
     fmt = "%Y-%m-%dT%H:%M:%SZ"
-    return (now - timedelta(hours=hours)).strftime(fmt), now.strftime(fmt)
+    return tuple(datetime.fromtimestamp(e - skew, tz).strftime(fmt) for e in (from_epoch, to_epoch))
 
 
 def _epoch(iso, skew, tz):

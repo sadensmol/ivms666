@@ -19,7 +19,7 @@ Routes:
     GET  /diagnose?device=<id>                       audit motion->email->UI pipeline
     POST /diagnose/fix  {device}                     auto-fix the fixable linkage gaps
     GET  /playback?device=<id>&ch=<track>&time=<YYYY-MM-DDTHH:MM:SS>  one recorded still (max-res)
-    GET  /events?device=<id>&ch=<track>&hours=<n>   motion event log (from recordings)
+    GET  /events?device=<id>&ch=<track>&hours=<n>|&from=<epoch>&to=<epoch>   motion event log (from recordings)
     GET  /clip?device=<id>&ch=<track>&start=&end=   one motion clip as MP4 (RTSP->ffmpeg)
     GET  /watch?device=<id>&ch=&start=&end=         shared player page (no creds in the link)
     GET  /watch/info?device=<id>                    camera NAME only, for the shared page title
@@ -234,12 +234,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not cfg:
                 self._send(404, "unknown device")
                 return
-            hours = int(q.get("hours", "24") or "24")
+            try:
+                # `from`/`to` = a picked range as real UTC epochs; else the last `hours`.
+                if q.get("from") and q.get("to"):
+                    frm, to = float(q["from"]), float(q["to"])
+                else:
+                    to = datetime.now().timestamp()
+                    frm = to - int(q.get("hours", "24") or "24") * 3600
+                if not frm < to:
+                    raise ValueError
+            except ValueError:
+                self._send(400, "bad range")
+                return
             try:
                 # The window must be in the DVR's own (drifting) wall clock, not this
-                # host's — see recordings.dvr_window. Thumbnails are grabbed live from
+                # host's — see recordings.dvr_span. Thumbnails are grabbed live from
                 # the DVR recording (via /playback); the list is just times/durations.
-                start, end = recordings.dvr_window(cfg, hours)
+                start, end = recordings.dvr_span(cfg, frm, to)
                 self._json(200, {"events": recordings.list_events(cfg, q.get("ch", "101"), start, end)})
             except Exception as e:  # noqa: BLE001
                 self._json(200, {"error": self._explain(e)})

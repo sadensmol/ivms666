@@ -326,8 +326,13 @@ or does not expose the feature at all.
 - **Event log** (`recordings.py`, per-tile ⚙ → "Event log"): once the DVR records
   on **motion** (diagnose fix), each recorded segment IS a motion event.
   `list_events` runs `POST /ISAPI/ContentMgmt/search` (`CMSearchDescription`, a
-  well-formed GUID `searchID` or it 400s) on the channel's track over the last N
-  hours and returns `{time, epoch, seconds, start, end}` per clip (newest first). The UI
+  well-formed GUID `searchID` or it 400s) on the channel's track over the picked
+  range and returns `{time, epoch, seconds, start, end}` per clip (newest first). **Range
+  picker:** the log header has a quick-range `<select id="evQuick">` (1h/6h/24h/3d/7d/today/
+  yesterday/custom) that only FILLS two `datetime-local` pickers (`evFrom`/`evTo`, viewer's
+  local time); the pickers are the one search window, sent as `from`/`to` epochs. Editing a
+  picker flips the select to `custom`; a relative preset is re-applied on every load
+  (`applyEvPreset`) so its "now" end stays current. The UI
   lists them; each row shows **ONE thumbnail grabbed live from the DVR recording** —
   a single `<img>` at `/playback?...&time=&res=480x270`, sampled ~12s in (just
   after the 10s pre-record, where the motion is), via `playback.grab_frame`
@@ -653,7 +658,7 @@ the name up on the module at call time. Preserve this pattern.
 | POST | `/save` `{device,ch}` | save a max-res (720p) JPEG to `save_path`, returns `{ok,path}` |
 | POST | `/reboot` `{device}` | reboot the whole device (`PUT /ISAPI/System/reboot`); per-device, drops all streams ~1 min |
 | GET | `/playback?device=<id>&ch=<track>&time=<ISO>` | one max-res still from the recording at a time |
-| GET | `/events?device=<id>&ch=<track>&hours=<n>` | motion event log (paged CMSearch over the last n hours of REAL time) → `{events:[{time,epoch,seconds,start,end}]}` — `time` is DVR clock, `epoch` the real instant (browser renders it in its own tz) |
+| GET | `/events?device=<id>&ch=<track>&from=<epoch>&to=<epoch>` (or legacy `&hours=<n>`) | motion event log (paged CMSearch over a REAL-time range — `from`/`to` are UTC epochs from the browser's From/To pickers, converted to the DVR clock by `recordings.dvr_span`; bad/reversed range → 400) → `{events:[{time,epoch,seconds,start,end}]}` — `time` is DVR clock, `epoch` the real instant (browser renders it in its own tz) |
 | GET | `/clip?device=<id>&ch=<track>&start=&end=` | one motion clip as MP4 (RTSP playback→ffmpeg, streamed) |
 | GET | `/watch?device=<id>&ch=&start=&end=&t=<epoch>` | **shared-link player page** (`static/watch.html`) — plays that one recording; the link holds NO credentials |
 | GET | `/watch/info?device=<id>` | camera **name only**, for the shared page's title |
